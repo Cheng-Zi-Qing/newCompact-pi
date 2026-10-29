@@ -1,0 +1,30 @@
+{
+  "name": "pi-compact",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Snapshot-style compaction for pi: bounded rewrite summaries, rapid-loop guard, usage fallback, tool-result pruning.",
+  "type": "module",
+  "keywords": [
+    "pi-package"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "scripts": {
+    "pretest": "node scripts/gen-tsconfig.mjs",
+    "test": "bun test"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/compact.ts",
+      "./extensions/tool-result-pruner.ts"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Cheng-Zi-Qing/newCompact-pi.git"
+  },
+  "license": "MIT"
+}
