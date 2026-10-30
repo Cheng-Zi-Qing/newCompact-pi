@@ -35,7 +35,7 @@ describe("summarize", () => {
     const out = await summarize(i);
     expect(out.compaction.summary).toContain("## Next Steps");
     expect(out.compaction.summary).toContain(`Older details: ${archivePath(i.sessionId)}`);
-    expect(calls[0].opts).toMatchObject({ maxTokens: 12288, reasoningEffort: "low", cacheRetention: "none" });
+    expect(calls[0].opts).toMatchObject({ maxTokens: 12288, reasoning: "low", cacheRetention: "none" });
     expect(readFileSync(archivePath(i.sessionId), "utf8")).toContain("OLD SUMMARY");
   });
   test("stop:length -> fallback", async () => { await fails(summarize(input([reply(snapshot(), "length")])), "stop:length"); });
@@ -79,9 +79,16 @@ describe("summarize", () => {
     const text = readFileSync(archivePath(sessionId), "utf8");
     expect(text.indexOf("OLD SUMMARY")).toBeLessThan(text.indexOf("SECOND"));
   });
-  test("non-reasoning model gets no reasoningEffort", async () => {
+  test("non-reasoning model gets no reasoning option; virtual model does", async () => {
     await summarize(input([reply(snapshot())], { model: { ...model, reasoning: false } }));
-    expect(calls[0].opts.reasoningEffort).toBeUndefined();
+    expect(calls[0].opts.reasoning).toBeUndefined();
+    await summarize(input([reply(snapshot())], { model: { ...model, api: "pi-virtual", reasoning: undefined } }));
+    expect(calls[0].opts.reasoning).toBe("low");
+  });
+  test("model without a context window uses the session window instead of failing capacity", async () => {
+    await fails(summarize(input([reply(snapshot())], { model: { ...model, contextWindow: 0 }, contextWindow: 16000 })), "capacity");
+    const out = await summarize(input([reply(snapshot())], { model: { ...model, contextWindow: 0 }, contextWindow: 128000 }));
+    expect(out.compaction.summary).toContain("## Goal");
   });
 });
 

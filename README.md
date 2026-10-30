@@ -14,9 +14,9 @@ flowchart TD
     Manual["/compact"] --> Before
     Native --> Before["session_before_compact"]
     Usage -->|"ctx.compact()（计为自动）"| Before
-    Before --> Guard{"guard（按会话、内存）<br/>60 秒内重复次数"}
-    Guard -->|"主会话第 3 次"| Pause["取消 + 暂停自动压缩<br/>提示用户 /compact"]
-    Guard -->|"subagent 第 3 次"| Abort["取消 + 中止本次运行<br/>交回主会话"]
+    Before --> Guard{"guard（按会话、内存）<br/>60 秒内重复次数 / 连续提交失败次数<br/>overflow 只计数、不拦截"}
+    Guard -->|"主会话：第 3 次快速重复<br/>或连续 2 次提交失败"| Pause["取消 + 暂停自动压缩<br/>提示用户 /compact"]
+    Guard -->|"subagent：同样条件"| Abort["写入 pi-compact-abort 记录<br/>取消 + 中止本次运行，交回主会话"]
     Guard -->|"放行：正常 6k / 第 2 次 3k"| Sum["快照摘要：一次 low 思考调用<br/>重写 8 节，不在旧摘要上追加"]
     Sum -->|"超 8k"| Condense["只浓缩该摘要一次"]
     Sum --> Check{"结构完整且 ≤ 8k？"}
@@ -56,7 +56,7 @@ pi remove git:github.com/Cheng-Zi-Qing/newCompact-pi
 ### 快照摘要
 
 - 摘要固定是 8 个章节：Goal / Authorization & Constraints / Verified Progress / Unfinished Work & Blockers / Key Decisions / Active Agents & Session State / Evidence & Critical Context / Next Steps。
-- 模型调用一次，用 `low` 思考，输出上限 12,288 tokens，不缓存。
+- 模型调用一次，通过 Pi 的 `modelRegistry.streamSimple` 发出（各家模型渠道和虚拟模型都由 Pi 统一处理），用 `low` 思考，输出上限 12,288 tokens，不缓存。
 - 目标长度 6k，硬上限 8k。超出 8k 时，只把这份摘要再浓缩一次；还是超出，或者结构不对、模型出错、被中止、容量不够，都交回 Pi 自带摘要。
 - 用户的授权和禁令原话保留并去重；已完成的事项每项一行；被推翻的决定、已结束的 agent、已解决的阻塞直接删除。
 
@@ -73,28 +73,32 @@ pi remove git:github.com/Cheng-Zi-Qing/newCompact-pi
 | Evidence & Critical Context | 1200 | 1200 |
 | Next Steps | 400 | 400 |
 
-**subagent 会话的判断**：会话头带 `parentSession` 字段，或者有 `model-route-state` 条目且其 `contextRole` 不是 `main`（由 pi-subagents-route 这类路由插件写入）。
-
 **subagent 的任务说明**：取子会话的第一条用户消息，原样附在 Goal 节。超过 2k tokens 时：
 
 - 会话已写入文件：保留开头，并附上会话文件路径和条目 ID；
 - 会话只在内存里：保留全文，仍然受 8k 硬上限约束。
 
-### guard（快速重复压缩熔断）
+### guard（熔断）
 
 状态只放在内存里，每个会话单独计数。
 
-- **计数方式**：自动压缩距上次自动压缩成功不到 60 秒，计数 +1；超过 60 秒清零。手动 `/compact` 不计数。
-- **第 2 次**：本次摘要目标收紧到 3k。这是目标值，硬上限仍然是 8k。
-- **第 3 次，主会话**：取消这次压缩，并暂停自动压缩。状态栏会一直显示，警告只弹一次。手动 `/compact` 成功后解除暂停。
-- **第 3 次，subagent**：subagent 的提示用户看不到，所以不暂停，而是中止这次运行，交回主会话决定续跑还是重新拆任务。
+- **快速重复计数**：自动压缩距上次自动压缩成功不到 60 秒，计数 +1；超过 60 秒清零。手动 `/compact` 不计数。
+- **提交失败计数**：插件发起的压缩提交失败（不含被中止的），计数 +1；任意一次提交成功后清零。Pi 自己在没有调用插件时报的失败不计。
+- **第 2 次快速重复**：本次摘要目标收紧到 3k。这是目标值，硬上限仍然是 8k。
+- **第 3 次快速重复，或连续 2 次提交失败**：
+  - **主会话**：取消这次压缩，并暂停自动压缩。状态栏会一直显示，警告只弹一次。手动 `/compact` 成功后解除暂停。
+  - **subagent**：subagent 的提示用户看不到，所以不暂停，而是先在会话里写入一条 `pi-compact-abort` 记录（`reason` 为 `compression-loop` 或 `commit-failures`，带子会话 ID；不会发给模型），再中止这次运行，交回主会话决定续跑还是重新拆任务。
+- **上下文溢出（overflow）从不拦截**：这时 Pi 已经删掉了失败的那条回复，要靠这次压缩后重试才能拿回回复；拦截的话这一轮会直接丢失。overflow 仍然计入快速重复次数。
+
+**subagent 会话的判断**：如果会话里有 `model-route-state` 条目（由 pi-subagents-route 这类路由插件写入），以其 `contextRole` 为准，`main` 即主会话；没有这个条目时，会话头带 `parentSession` 字段就当作 subagent。`/fork` 和分支出来的会话也带 `parentSession`，但它们复制了主会话的路由条目，所以仍按主会话处理。
 
 ### usage 兜底
 
-- 在 `agent_end` 时检查 provider 实际报告的用量。Pi 的估算会漏掉加密的推理 token，尤其是会话里有 context_edit 的时候。
+- 在 `agent_end` 时检查 provider 实际报告的用量。Pi 的估算会漏掉加密的推理 token，尤其是会话里有 context_edit 的时候。如果这份用量之后做过工具结果裁剪，会先减去裁掉部分的估算值，而不是整个作废。
 - 超过 `窗口 − reserve`（读取实际配置）才触发。
 - 以下情况不触发：
-  - 这份用量之后已经有压缩或裁剪（用量已过期）；
+  - 设置里关闭了自动压缩（`compaction.enabled: false`）；
+  - 这份用量之后已经有压缩（用量已过期），或有无法核算的裁剪；
   - 会话不空闲，或正在压缩（避免打断进行中的工作）；
   - guard 正处于暂停；
   - 距上次尝试不到 120 秒（节流）。
@@ -128,10 +132,12 @@ pi remove git:github.com/Cheng-Zi-Qing/newCompact-pi
 |---|---|
 | `ok` / `condensed` | 插件摘要成功 / 浓缩后成功 |
 | `fallback:<原因>` | 交回 Pi 自带摘要；原因为 capacity、structure、stop:length、over-cap、aborted 等 |
-| `committed` | 压缩已写入会话；`fromExtension=false` 表示用的是 Pi 自带摘要 |
-| `commit-failed` | 提交失败，附带是否被中止和错误信息 |
-| `cancel:paused` / `abort:compaction-loop` | guard 暂停 / subagent 被中止 |
-| `usage-trigger` / `usage-skip:*` | usage 兜底触发 / 跳过 |
+| `committed` | 压缩已写入会话；`fromExtension=false` 表示用的是 Pi 自带摘要；`reason=untracked:*` 表示不是插件发起的 |
+| `commit-failed` | 提交失败，附带是否被中止、当前连续失败次数（`failStreak`）和错误信息 |
+| `cancel:rapid-loop` / `cancel:commit-failures` / `cancel:paused` | 主会话进入暂停（快速重复 / 连续提交失败）/ 暂停期间被拦截 |
+| `abort:compression-loop` / `abort:commit-failures` | subagent 被中止 |
+| `usage-trigger` | usage 兜底触发 |
+| `usage-skip:disabled` / `:paused` / `:busy` / `:resolved` | usage 兜底跳过：自动压缩已关闭 / 处于暂停 / 会话不空闲或正在压缩 / 已不再超线 |
 
 按次统计某个会话的压缩情况（只读）：
 
@@ -154,8 +160,8 @@ npm test   # 先生成仅供测试用的 tsconfig.json（已被 gitignore），�
 
 - guard 状态只在内存里，重启或 `/reload` 后清零。
 - 主会话暂停期间，如果一直不处理，上下文仍会继续增长。这是有意的取舍，避免压缩循环白白消耗 token。
-- subagent 被中止时，主会话只看到"运行被中止"，看不到原因；原因写在日志里。
-- 不落盘的嵌套 subagent，如果既没有 `parentSession`，也没有路由插件写入的角色标记，会被当成主会话处理。
+- subagent 被中止时，原因写在子会话的 `pi-compact-abort` 记录和日志里；主会话一侧只看到"运行被中止"，要识别原因需要主会话那边自己去读这条记录。
+- 不落盘的嵌套 subagent，如果既没有 `parentSession`，也没有路由插件写入的角色标记，会被当成主会话处理（连续压缩时暂停，而不是中止）。
 - 子会话的任务说明取的是第一条用户消息。如果派任务时带上了父会话的上下文，开头会是那段上下文；截断时，真正的任务说明可能被截掉。
 - 回退到 Pi 自带摘要的那一次，不会继承插件生成的文件读写列表。
 - 单条消息本身就超过上下文窗口时，插件和 Pi 自带摘要都会失败。

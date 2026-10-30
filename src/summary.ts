@@ -83,12 +83,14 @@ export type Complete = (model: any, context: any, options: any) => Promise<any>;
 export type SummaryInput = {
   preparation: any; branchEntries: any[]; customInstructions?: string; signal: AbortSignal;
   model: any; complete: Complete; sessionId: string; sessionFile?: string; isSubagent: boolean; budget: number;
+  contextWindow?: number; // fallback when the model reports none (e.g. virtual models)
 };
 
 async function call(input: SummaryInput, system: string, text: string) {
   const { model, signal } = input;
+  // Provider-neutral options for modelRegistry.streamSimple (handles every API and virtual models).
   const options: any = { maxTokens: OUTPUT_CAP, cacheRetention: "none", signal };
-  if (model.reasoning) options.reasoningEffort = "low";
+  if (model.reasoning || model.api === "pi-virtual") options.reasoning = "low";
   const res = await input.complete(model, { systemPrompt: system, messages: [{ role: "user", content: [{ type: "text", text }], timestamp: Date.now() }] }, options);
   if (signal.aborted) fallback("aborted");
   if (res?.stopReason !== "stop") fallback(`stop:${res?.stopReason}`);
@@ -106,7 +108,8 @@ export async function summarize(input: SummaryInput) {
   const source = `<previous-summary>\n${preparation.previousSummary ?? "(none)"}\n</previous-summary>\n\n<conversation>\n${conversation}\n</conversation>` +
     (input.customInstructions ? `\n\nAdditional focus from the user: ${input.customInstructions}` : "");
   const system = prompt(budget, isSubagent);
-  if (Math.ceil(textTokens(system + source) * 1.2) + OUTPUT_CAP + 4096 > model.contextWindow) fallback("capacity");
+  const window = model.contextWindow || input.contextWindow;
+  if (window && Math.ceil(textTokens(system + source) * 1.2) + OUTPUT_CAP + 4096 > window) fallback("capacity");
 
   const archive = archivePath(input.sessionId);
   const brief = isSubagent ? taskBrief(input.branchEntries, input.sessionFile) : undefined;

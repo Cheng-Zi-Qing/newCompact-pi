@@ -17,7 +17,7 @@ function fakePi(activeTools = ["read_tool_result"], settings: any = {}) {
   const handlers: Record<string, Function> = {}; const tools: Record<string, any> = {}; const actions: any[] = [];
   return { handlers, tools, actions, on: (n: string, h: Function) => { handlers[n] = h; }, registerTool: (t: any) => { tools[t.name] = t; },
     getActiveTools: () => activeTools, getSettings: () => settings,
-    sendMessage: (message: any, options: any) => actions.push({ kind: "sendMessage", message, options }) } as any;
+    appendEntry: (customType: string, data: any) => actions.push({ kind: "appendEntry", customType, data }) } as any;
 }
 const model = { id: "m", provider: "p", api: "openai-responses", reasoning: true, contextWindow: 128000, maxTokens: 16384 };
 const toolResult = (text: string) => ({ role: "toolResult", toolCallId: "t", toolName: "bash", content: [{ type: "text", text }], isError: false, timestamp: 2 });
@@ -72,7 +72,7 @@ describe("compact entry wiring", () => {
     resetStates();
     const pi = fakePi(); compact(pi);
     const { ctx } = session([], header);
-    ctx.modelRegistry = { complete: async () => reply };
+    ctx.modelRegistry = { streamSimple: () => ({ result: async () => reply }) };
     ctx.abort = mock(() => pi.actions.push({ kind: "abort" }));
     ctx.compact = mock();
     ctx.isIdle = () => true;
@@ -93,11 +93,11 @@ describe("compact entry wiring", () => {
   });
   test("subagent loop aborts the run instead of pausing", async () => {
     const { pi, ctx } = setup({ stopReason: "stop", content: [{ type: "text", text: snapshot }] }, { parentSession: "/p.jsonl" });
-    for (let i = 0; i < 3; i++) { await pi.handlers.session_before_compact(event(), ctx); pi.handlers.session_compact({ reason: "threshold", compactionEntry: { summary: "s" }, fromExtension: true }, ctx); }
+    for (let i = 0; i < 2; i++) { await pi.handlers.session_before_compact(event(), ctx); pi.handlers.session_compact({ reason: "threshold", compactionEntry: { summary: "s" }, fromExtension: true }, ctx); }
     expect(await pi.handlers.session_before_compact(event(), ctx)).toEqual({ cancel: true });
     expect(ctx.abort).toHaveBeenCalled();
     expect(pi.actions).toEqual([
-      { kind: "sendMessage", message: { customType: "pi-compact-abort", content: "压缩循环", details: { reason: "compression-loop", sessionId: ctx.sessionManager.getSessionId() } }, options: { triggerTurn: false } },
+      { kind: "appendEntry", customType: "pi-compact-abort", data: { reason: "compression-loop", sessionId: ctx.sessionManager.getSessionId(), streak: 2, failStreak: 0 } },
       { kind: "abort" },
     ]);
     // The stopped run ends with agent_end; the usage fallback must not compact it again.
@@ -121,7 +121,7 @@ describe("compact entry wiring", () => {
     resetStates(); ctx.isIdle = () => false;
     pi.handlers.agent_end({}, ctx); await tick();
     expect(ctx.compact).toHaveBeenCalledTimes(1);
-    resetStates(); ctx.isIdle = () => true; stateOf(ctx.sessionManager.getSessionId()).compacting = true;
+    resetStates(); ctx.isIdle = () => true; stateOf(ctx.sessionManager.getSessionId()).attempt = { reason: "threshold", streak: 0, at: Date.now() };
     pi.handlers.agent_end({}, ctx); await tick();
     expect(ctx.compact).toHaveBeenCalledTimes(1);
     // Native compaction already ran before agent_end: stale usage must not trigger again.
@@ -134,7 +134,7 @@ describe("compact entry wiring", () => {
     usageDelay.ms = 30;
     try {
       const { pi, ctx } = setup({ stopReason: "stop", content: [{ type: "text", text: snapshot }] }, { parentSession: "/p.jsonl" });
-      for (let i = 0; i < 3; i++) { await pi.handlers.session_before_compact(event(), ctx); pi.handlers.session_compact({ reason: "threshold", compactionEntry: { summary: "s" }, fromExtension: true }, ctx); }
+      for (let i = 0; i < 2; i++) { await pi.handlers.session_before_compact(event(), ctx); pi.handlers.session_compact({ reason: "threshold", compactionEntry: { summary: "s" }, fromExtension: true }, ctx); }
       const sm = SessionManager.inMemory("/tmp");
       sm.appendMessage({ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", api: "x", provider: "p", model: "m", timestamp: 1,
         usage: { input: 120_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 120_000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } as any);
@@ -148,8 +148,39 @@ describe("compact entry wiring", () => {
       expect(ctx.compact).not.toHaveBeenCalled();
     } finally { usageDelay.ms = 0; }
   });
-  test("subagent detection: parentSession header or non-main route role", () => {
+  test("paused main session: overflow recovery still compacts (the reply would be lost otherwise)", async () => {
+    const { pi, ctx } = setup({ stopReason: "stop", content: [{ type: "text", text: snapshot }] });
+    for (let i = 0; i < 2; i++) { await pi.handlers.session_before_compact(event(), ctx); pi.handlers.session_compact({ reason: "threshold", compactionEntry: { summary: "s" }, fromExtension: true }, ctx); }
+    expect(await pi.handlers.session_before_compact(event(), ctx)).toEqual({ cancel: true });
+    expect((await pi.handlers.session_before_compact(event("overflow"), ctx)).compaction.summary).toContain("## Goal");
+  });
+  test("two failed commits in a row pause the main session", async () => {
+    const { pi, ctx } = setup({ stopReason: "stop", content: [{ type: "text", text: snapshot }] });
+    for (let i = 0; i < 2; i++) {
+      expect((await pi.handlers.session_before_compact(event(), ctx)).compaction).toBeDefined();
+      pi.handlers.session_compact_failed({ reason: "threshold", aborted: false, fromExtension: true, errorMessage: "disk full" }, ctx);
+    }
+    expect(await pi.handlers.session_before_compact(event(), ctx)).toEqual({ cancel: true });
+    expect(ctx.ui.notify).toHaveBeenCalledTimes(1);
+  });
+  test("usage fallback respects compaction.enabled=false", async () => {
+    resetStates();
+    const pi = fakePi(["read_tool_result"], { compaction: { enabled: false } }); compact(pi);
+    const { ctx } = session([]);
+    ctx.compact = mock(); ctx.isIdle = () => true;
+    const sm = SessionManager.inMemory("/tmp");
+    sm.appendMessage({ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", api: "x", provider: "p", model: "m", timestamp: 1,
+      usage: { input: 127_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 127_000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } as any);
+    ctx.sessionManager.getBranch = () => sm.getBranch();
+    pi.handlers.agent_end({}, ctx); await tick();
+    expect(ctx.compact).not.toHaveBeenCalled();
+  });
+  test("subagent detection: route role wins; parentSession only as fallback", () => {
     expect(isSubagent(session([], { parentSession: "/p" }).ctx)).toBe(true);
+    // /fork: parentSession set, but the copied route entry says main
+    const forked = session([], { parentSession: "/p" });
+    forked.sm.appendCustomEntry("model-route-state", { contextRole: "main" });
+    expect(isSubagent(forked.ctx)).toBe(false);
     const { sm, ctx } = session([]);
     expect(isSubagent(ctx)).toBe(false);
     sm.appendCustomEntry("model-route-state", { contextRole: "main" });
