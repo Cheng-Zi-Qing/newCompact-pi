@@ -98,6 +98,15 @@ describe("subagent task brief", () => {
     expect(calls[0].ctx.systemPrompt).toContain("<= 4800 tokens");
     expect(calls[0].ctx.systemPrompt).toContain("Authorization & Constraints: 300");
   });
+  test("snapshot under 8k but over after adding brief + pointer -> condense once, then succeed", async () => {
+    const brief = "brief ".repeat(1500).trim(); // ~1.9k tokens, under the 2k brief cap
+    const raw = snapshot("word ".repeat(6400 / 8 * 4 / 5)); // ~6.4k tokens on its own
+    const out = await summarize(input([reply(raw), reply(snapshot())], { isSubagent: true, branchEntries: entries(brief) }));
+    expect(calls.length).toBe(2);
+    expect(out.condensed).toBe(true);
+    expect(out.compaction.summary).toContain(brief);
+    expect(out.tokens).toBeLessThanOrEqual(HARD_CAP);
+  });
   test("long brief on a persisted session: head + entry pointer", () => {
     const text = taskBrief(entries("长任务说明".repeat(2000)), "/s/file.jsonl")!;
     expect(text).toContain("[truncated; full brief: /s/file.jsonl entry 11111111]");

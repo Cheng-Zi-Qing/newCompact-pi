@@ -108,18 +108,19 @@ export async function summarize(input: SummaryInput) {
   const system = prompt(budget, isSubagent);
   if (Math.ceil(textTokens(system + source) * 1.2) + OUTPUT_CAP + 4096 > model.contextWindow) fallback("capacity");
 
+  const archive = archivePath(input.sessionId);
+  const brief = isSubagent ? taskBrief(input.branchEntries, input.sessionFile) : undefined;
+  // The 8k cap applies to what is committed: snapshot + verbatim brief + archive pointer.
+  const assemble = (text: string) => (brief ? insertBrief(text, brief) : text) + `\n\nOlder details: ${archive} (read it only if needed).`;
   let result = await call(input, system, source);
+  let summary = assemble(result.text);
   let condensed = false;
-  if (textTokens(result.text) > HARD_CAP) {
+  if (textTokens(summary) > HARD_CAP) {
     const target = Math.min(budget, 6000);
     result = await call(input, prompt(target, isSubagent), `<previous-summary>\n${result.text}\n</previous-summary>\n\nCondense this snapshot to fit the budget. Keep authorizations/prohibitions verbatim.`);
+    summary = assemble(result.text);
     condensed = true;
   }
-  const archive = archivePath(input.sessionId);
-  let summary = result.text;
-  const brief = isSubagent ? taskBrief(input.branchEntries, input.sessionFile) : undefined;
-  if (brief) summary = insertBrief(summary, brief);
-  summary += `\n\nOlder details: ${archive} (read it only if needed).`;
   if (textTokens(summary) > HARD_CAP) fallback("over-cap");
   if (signal.aborted) fallback("aborted");
 

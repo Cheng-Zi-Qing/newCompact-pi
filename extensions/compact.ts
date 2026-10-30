@@ -46,9 +46,13 @@ export default function piCompact(pi: ExtensionAPI) {
     }
     if (d.action === "abort") {
       failed(s);
+      s.paused = true; // blocks the usage fallback from re-compacting the stopped run; a later manual /compact clears it
       log({ ...base, streak: d.streak, result: "abort:compaction-loop" });
       try { ctx.ui.notify("pi-compact: compaction loop in subagent; stopping this run so the parent can decide.", "error"); } catch { /* optional */ }
-      // shortcut: the parent sees an aborted run, not this reason text; the reason is in pi-compact.log.
+      // Marker first, so the reason is in the child transcript before the run stops.
+      try {
+        pi.sendMessage({ customType: "pi-compact-abort", content: "压缩循环", details: { reason: "compression-loop", sessionId } }, { triggerTurn: false });
+      } catch { /* the abort below still stops the loop */ }
       ctx.abort();
       return { cancel: true };
     }
@@ -71,6 +75,7 @@ export default function piCompact(pi: ExtensionAPI) {
     const s = stateOf(ctx.sessionManager.getSessionId());
     const reason = effectiveReason(s, (event as any).reason ?? "threshold");
     committed(s, reason, Date.now());
+    if (isSubagent(ctx)) s.paused = false; // a successful compaction ends a subagent's post-abort usage block
     log({ session: ctx.sessionManager.getSessionId(), reason, result: "committed", fromExtension: event.fromExtension,
       summaryTokens: textTokens(event.compactionEntry.summary ?? "") });
     if (!s.paused) try { ctx.ui.setStatus(STATUS, undefined); } catch { /* optional */ }
@@ -95,8 +100,9 @@ export default function piCompact(pi: ExtensionAPI) {
         try {
           const sessionId = ctx.sessionManager.getSessionId();
           const again = usageInputs(pi, ctx);
-          if (s.compacting || !ctx.isIdle() || again.total === undefined || again.total <= again.window - again.reserve) {
-            log({ session: sessionId, usageTotal: again.total, result: s.compacting || !ctx.isIdle() ? "usage-skip:busy" : "usage-skip:resolved" });
+          // Re-check pause: the guard may have paused/aborted this session after the timer was queued.
+          if (s.paused || s.compacting || !ctx.isIdle() || again.total === undefined || again.total <= again.window - again.reserve) {
+            log({ session: sessionId, usageTotal: again.total, result: s.paused ? "usage-skip:paused" : s.compacting || !ctx.isIdle() ? "usage-skip:busy" : "usage-skip:resolved" });
             return;
           }
           s.usagePending = true;

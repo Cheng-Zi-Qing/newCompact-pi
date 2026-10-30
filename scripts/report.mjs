@@ -26,4 +26,6 @@ console.table(rows);
 console.log(`compactions=${rows.length} length-truncations(output<=16)=${truncated.length}${truncated.length ? " at " + truncated.join(", ") : ""}`);
 const s = rows.map(r => r.summaryTokens);
 const monotonic = s.length >= 3 && s.slice(-3).every((v, i, a) => i === 0 || v > a[i - 1]);
-console.log(`check: maxSummary=${Math.max(0, ...s)} (<=8000) firstTurnAfter<=55000:${rows.every(r => r.firstTurnAfter === "unknown" || r.firstTurnAfter <= 55000)} gaps>60s:${rows.every(r => r.gapSec === "-" || r.gapSec > 60)} last3Monotonic:${monotonic}`);
+// Tri-state: a check with missing data is "unknown", never a pass.
+const tri = (values, ok) => values.some(v => !ok(v)) ? false : values.some(v => v === "unknown") ? "unknown" : true;
+console.log(`check: maxSummary=${Math.max(0, ...s)} (<=8000) firstTurnAfter<=55000:${tri(rows.map(r => r.firstTurnAfter), v => v === "unknown" || v <= 55000)} gaps>60s:${rows.every(r => r.gapSec === "-" || r.gapSec > 60)} last3Monotonic:${monotonic}`);

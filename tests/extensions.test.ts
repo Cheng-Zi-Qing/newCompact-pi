@@ -14,9 +14,10 @@ const { SECTIONS } = await import("../src/summary.ts");
 const { resetStates, stateOf } = await import("../src/guard.ts");
 
 function fakePi(activeTools = ["read_tool_result"], settings: any = {}) {
-  const handlers: Record<string, Function> = {}; const tools: Record<string, any> = {};
-  return { handlers, tools, on: (n: string, h: Function) => { handlers[n] = h; }, registerTool: (t: any) => { tools[t.name] = t; },
-    getActiveTools: () => activeTools, getSettings: () => settings } as any;
+  const handlers: Record<string, Function> = {}; const tools: Record<string, any> = {}; const actions: any[] = [];
+  return { handlers, tools, actions, on: (n: string, h: Function) => { handlers[n] = h; }, registerTool: (t: any) => { tools[t.name] = t; },
+    getActiveTools: () => activeTools, getSettings: () => settings,
+    sendMessage: (message: any, options: any) => actions.push({ kind: "sendMessage", message, options }) } as any;
 }
 const model = { id: "m", provider: "p", api: "openai-responses", reasoning: true, contextWindow: 128000, maxTokens: 16384 };
 const toolResult = (text: string) => ({ role: "toolResult", toolCallId: "t", toolName: "bash", content: [{ type: "text", text }], isError: false, timestamp: 2 });
@@ -72,7 +73,7 @@ describe("compact entry wiring", () => {
     const pi = fakePi(); compact(pi);
     const { ctx } = session([], header);
     ctx.modelRegistry = { complete: async () => reply };
-    ctx.abort = mock();
+    ctx.abort = mock(() => pi.actions.push({ kind: "abort" }));
     ctx.compact = mock();
     ctx.isIdle = () => true;
     return { pi, ctx };
@@ -95,6 +96,17 @@ describe("compact entry wiring", () => {
     for (let i = 0; i < 3; i++) { await pi.handlers.session_before_compact(event(), ctx); pi.handlers.session_compact({ reason: "threshold", compactionEntry: { summary: "s" }, fromExtension: true }, ctx); }
     expect(await pi.handlers.session_before_compact(event(), ctx)).toEqual({ cancel: true });
     expect(ctx.abort).toHaveBeenCalled();
+    expect(pi.actions).toEqual([
+      { kind: "sendMessage", message: { customType: "pi-compact-abort", content: "压缩循环", details: { reason: "compression-loop", sessionId: ctx.sessionManager.getSessionId() } }, options: { triggerTurn: false } },
+      { kind: "abort" },
+    ]);
+    // The stopped run ends with agent_end; the usage fallback must not compact it again.
+    const sm = SessionManager.inMemory("/tmp");
+    sm.appendMessage({ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", api: "x", provider: "p", model: "m", timestamp: 1,
+      usage: { input: 120_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 120_000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } as any);
+    ctx.sessionManager.getBranch = () => sm.getBranch();
+    pi.handlers.agent_end({}, ctx); await tick();
+    expect(ctx.compact).not.toHaveBeenCalled();
   });
   test("agent_end triggers ctx.compact once usage crosses the configured reserve", async () => {
     const { pi, ctx } = setup(undefined);
@@ -117,6 +129,24 @@ describe("compact entry wiring", () => {
     sm.appendCompaction("s", sm.getBranch()[0].id, 120_000, {}, true);
     pi.handlers.agent_end({}, ctx); await tick();
     expect(ctx.compact).toHaveBeenCalledTimes(1);
+  });
+  test("usage timer queued before a guard abort does not compact afterwards", async () => {
+    usageDelay.ms = 30;
+    try {
+      const { pi, ctx } = setup({ stopReason: "stop", content: [{ type: "text", text: snapshot }] }, { parentSession: "/p.jsonl" });
+      for (let i = 0; i < 3; i++) { await pi.handlers.session_before_compact(event(), ctx); pi.handlers.session_compact({ reason: "threshold", compactionEntry: { summary: "s" }, fromExtension: true }, ctx); }
+      const sm = SessionManager.inMemory("/tmp");
+      sm.appendMessage({ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", api: "x", provider: "p", model: "m", timestamp: 1,
+        usage: { input: 120_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 120_000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } as any);
+      const realBranch = ctx.sessionManager.getBranch;
+      ctx.sessionManager.getBranch = () => sm.getBranch();
+      pi.handlers.agent_end({}, ctx);              // timer queued while not paused
+      ctx.sessionManager.getBranch = realBranch;
+      expect(await pi.handlers.session_before_compact(event(), ctx)).toEqual({ cancel: true }); // guard aborts, pauses
+      ctx.sessionManager.getBranch = () => sm.getBranch();
+      await new Promise(r => setTimeout(r, 80));  // real delay elapses
+      expect(ctx.compact).not.toHaveBeenCalled();
+    } finally { usageDelay.ms = 0; }
   });
   test("subagent detection: parentSession header or non-main route role", () => {
     expect(isSubagent(session([], { parentSession: "/p" }).ctx)).toBe(true);
