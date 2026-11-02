@@ -1,7 +1,7 @@
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, renameSync, statSync } from "node:fs";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { busy, committed, decide, dropState, failed, stateOf } from "../src/guard.ts";
+import { committed, decide, dropState, failed, stateOf } from "../src/guard.ts";
 import { dataDir, Fallback, summarize } from "../src/summary.ts";
 import { usageDecision, usageInputs } from "../src/usage.ts";
 import { textTokens } from "../src/estimate.ts";
@@ -23,6 +23,7 @@ export function log(fields: Record<string, unknown>) {
   try {
     const file = path.join(dataDir(), "pi-compact.log");
     mkdirSync(path.dirname(file), { recursive: true });
+    if (existsSync(file) && statSync(file).size > 5 * 1024 * 1024) renameSync(file, `${file}.1`);
     appendFileSync(file, `${new Date().toISOString()} ${Object.entries(fields).map(([k, v]) => `${k}=${v}`).join(" ")}\n`);
   } catch { /* diagnostics only */ }
 }
@@ -104,8 +105,10 @@ export default function piCompact(pi: ExtensionAPI) {
           const sessionId = ctx.sessionManager.getSessionId();
           const again = usageInputs(pi, ctx);
           // Re-check everything: the guard may have paused/aborted this session after the timer was queued.
-          const skip = !again.enabled ? "disabled" : s.paused ? "paused" : busy(s, Date.now()) || !ctx.isIdle() ? "busy"
-            : again.total === undefined || again.total <= again.window - again.reserve ? "resolved" : undefined;
+          const d = usageDecision(s, again.total, again.window, again.reserve, again.enabled, Date.now());
+          // Ignore "throttled": this timer's first check just set usageLastAttempt.
+          const skip = d === "disabled" || d === "paused" ? d : d === "busy" || !ctx.isIdle() ? "busy"
+            : d === "no-data" || d === "small" ? "resolved" : undefined;
           if (skip) { log({ session: sessionId, usageTotal: again.total, result: `usage-skip:${skip}` }); return; }
           s.usagePending = true;
           log({ session: sessionId, usageTotal: again.total, limit: again.window - again.reserve, result: "usage-trigger" });

@@ -1,7 +1,6 @@
 import { appendFileSync, mkdirSync } from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
+import { convertToLlm, getAgentDir, serializeConversation } from "@earendil-works/pi-coding-agent";
 import { textTokens } from "./estimate.ts";
 
 export const OUTPUT_CAP = 12288;
@@ -14,7 +13,7 @@ const SUB_SPLIT = [0, 300, 1000, 1000, 800, 100, 1200, 400]; // subagent Goal = 
 // Plan 4.6 per-section table: subagent non-brief sections total 4800 (+ brief <= 2000 = 6.8k, under the 8k cap).
 const SUB_SHARE = 4800 / 6000;
 
-export const dataDir = () => process.env.PI_COMPACT_DIR ?? path.join(os.homedir(), ".pi/agent");
+export const dataDir = () => process.env.PI_COMPACT_DIR ?? getAgentDir();
 export const archivePath = (sessionId: string) => path.join(dataDir(), "compaction-archive", `${sessionId}.md`);
 
 export class Fallback extends Error {}

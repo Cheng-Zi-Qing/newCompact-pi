@@ -114,9 +114,11 @@ pi remove git:github.com/Cheng-Zi-Qing/newCompact-pi
 
 | 内容 | 位置 |
 |---|---|
-| 日志 | `~/.pi/agent/pi-compact.log` |
-| 归档 | `~/.pi/agent/compaction-archive/<sessionId>.md` |
+| 日志 | `<agentDir>/pi-compact.log`（`<agentDir>` 通常为 `~/.pi/agent`，遵循 `PI_CODING_AGENT_DIR`） |
+| 归档 | `<agentDir>/compaction-archive/<sessionId>.md` |
 | 改目录 | 设置环境变量 `PI_COMPACT_DIR`，上面两项会改写到该目录下 |
+
+日志超过 5 MB 时，下次写入前轮换到 `pi-compact.log.1`，覆盖旧备份。
 
 日志每行一次事件，主要字段：
 
@@ -153,7 +155,7 @@ node scripts/report.mjs ~/.pi/agent/sessions/<目录>/<会话>.jsonl
 npm test   # 先生成仅供测试用的 tsconfig.json（已被 gitignore），再运行 bun test
 ```
 
-- 需要 [bun](https://bun.sh)，并且本机全局安装了 pi。宿主包默认从 `~/.bun/install/global/node_modules` 解析，可以用 `PI_GLOBAL_NODE_MODULES` 改路径。
+- 需要 [bun](https://bun.sh) 和本机安装的 pi。测试宿主包依次从 `PI_GLOBAL_NODE_MODULES`、`PI_MANAGED_INSTALL_ROOT`（默认 `~/.pi/agent/install`）的 `releases/<current-version>/node_modules`、默认安装目录的同类发布路径、`~/.bun/install/global/node_modules` 解析，选第一个含 pi 包的目录；找不到时会列出尝试的路径。
 - `tests/estimate.consistency.test.ts` 是**常驻回归测试**。插件用公开接口重新实现了 Pi 内部的上下文 token 估算（内部函数没有导出），这个测试拿它和当前安装的 Pi 内部实现，在构造场景和本机最新的会话文件上逐一比对。**每次升级 Pi 后都要重跑**，结果不一致说明 Pi 改了估算规则，需要同步更新插件。
 
 ## 已知限制

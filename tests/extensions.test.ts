@@ -1,5 +1,5 @@
 import { describe, expect, mock, test } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -7,7 +7,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 process.env.PI_COMPACT_DIR = mkdtempSync(path.join(os.tmpdir(), "pi-compact-ext-"));
 const pruner = (await import("../extensions/tool-result-pruner.ts")).default;
 const compact = (await import("../extensions/compact.ts")).default;
-const { isSubagent, usageDelay } = await import("../extensions/compact.ts");
+const { isSubagent, log, usageDelay } = await import("../extensions/compact.ts");
 usageDelay.ms = 0;
 const tick = () => new Promise(r => setTimeout(r, 5));
 const { SECTIONS } = await import("../src/summary.ts");
@@ -31,6 +31,21 @@ function session(msgs: any[], header: any = {}) {
     getContextUsage: () => ({ contextWindow: 128000 }), ui: { notify: mock(), setStatus: mock() } } as any };
 }
 const turnEnd = (sm: any) => ({ outcome: "completed", entries: [], context: { contextEntries: sm.buildSessionProjection().entries } });
+
+describe("diagnostic log", () => {
+  test("rotates over 5 MB and replaces the previous backup", () => {
+    const file = path.join(process.env.PI_COMPACT_DIR!, "pi-compact.log");
+    writeFileSync(file, "x".repeat(5 * 1024 * 1024));
+    log({ result: "at-limit" });
+    expect(statSync(file).size).toBeGreaterThan(5 * 1024 * 1024);
+    writeFileSync(`${file}.1`, "old backup");
+    log({ result: "rotated" });
+    expect(readFileSync(`${file}.1`, "utf8")).toContain("result=at-limit");
+    const text = readFileSync(file, "utf8");
+    expect(text).toContain("result=rotated");
+    expect(text).not.toContain("result=at-limit");
+  });
+});
 
 describe("tool-result pruner", () => {
   const big = "x".repeat(60_000);
@@ -129,6 +144,22 @@ describe("compact entry wiring", () => {
     sm.appendCompaction("s", sm.getBranch()[0].id, 120_000, {}, true);
     pi.handlers.agent_end({}, ctx); await tick();
     expect(ctx.compact).toHaveBeenCalledTimes(1);
+  });
+  test("usage timer skips when the context window disappears", async () => {
+    usageDelay.ms = 30;
+    try {
+      const { pi, ctx } = setup(undefined);
+      const sm = SessionManager.inMemory("/tmp");
+      sm.appendMessage({ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", api: "x", provider: "p", model: "m", timestamp: 1,
+        usage: { input: 120_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 120_000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } as any);
+      ctx.sessionManager.getBranch = () => sm.getBranch();
+      pi.handlers.agent_end({}, ctx);
+      expect(stateOf(ctx.sessionManager.getSessionId()).usageLastAttempt).toBeGreaterThan(0);
+      ctx.getContextUsage = () => undefined; ctx.model = { ...model, contextWindow: undefined };
+      await new Promise(r => setTimeout(r, 80));
+      expect(ctx.compact).not.toHaveBeenCalled();
+      expect(readFileSync(path.join(process.env.PI_COMPACT_DIR!, "pi-compact.log"), "utf8").trim().split("\n").at(-1)).toContain("result=usage-skip:resolved");
+    } finally { usageDelay.ms = 0; }
   });
   test("usage timer queued before a guard abort does not compact afterwards", async () => {
     usageDelay.ms = 30;

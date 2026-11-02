@@ -4,6 +4,7 @@
   "version": "0.1.0",
   "description": "Snapshot-style compaction for pi: bounded rewrite summaries, rapid-loop guard, usage fallback, tool-result pruning.",
   "type": "module",
+  "files": ["extensions", "src", "LICENSE", "README.md"],
   "keywords": [
     "pi-package"
   ],

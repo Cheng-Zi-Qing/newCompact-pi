@@ -8,7 +8,7 @@ process.env.PI_COMPACT_DIR = tmp;
 const prodLog = path.join(os.homedir(), ".pi/agent/pi-compact.log");
 const prodLogBefore = existsSync(prodLog) ? statSync(prodLog).mtimeMs : null;
 
-const { summarize, SECTIONS, Fallback, archivePath, taskBrief, HARD_CAP } = await import("../src/summary.ts");
+const { summarize, SECTIONS, Fallback, archivePath, dataDir, taskBrief, HARD_CAP } = await import("../src/summary.ts");
 const { textTokens } = await import("../src/estimate.ts");
 
 const model = { id: "m", provider: "p", api: "openai-responses", reasoning: true, contextWindow: 128000, maxTokens: 16384 };
@@ -28,6 +28,22 @@ function input(replies: any[], over: any = {}) {
   };
 }
 const fails = async (p: Promise<any>, why: string) => { const e = await p.then(() => null, e => e); expect(e).toBeInstanceOf(Fallback); expect(e.message).toBe(why); };
+
+describe("data directory", () => {
+  test("uses the host agent directory unless PI_COMPACT_DIR overrides it", () => {
+    const compactDir = process.env.PI_COMPACT_DIR, agentDir = process.env.PI_CODING_AGENT_DIR;
+    try {
+      process.env.PI_CODING_AGENT_DIR = path.join(tmp, "agent");
+      expect(dataDir()).toBe(compactDir!);
+      delete process.env.PI_COMPACT_DIR;
+      expect(dataDir()).toBe(process.env.PI_CODING_AGENT_DIR!);
+    } finally {
+      process.env.PI_COMPACT_DIR = compactDir;
+      if (agentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+      else process.env.PI_CODING_AGENT_DIR = agentDir;
+    }
+  });
+});
 
 describe("summarize", () => {
   test("normal: 8 sections, archive pointer, low reasoning, previous summary archived", async () => {
