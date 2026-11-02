@@ -3,7 +3,7 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { busy, committed, decide, dropState, failed, stateOf } from "../src/guard.ts";
 import { dataDir, Fallback, summarize } from "../src/summary.ts";
-import { compactionLine, effectiveContextTokens, usageDecision, usageInputs } from "../src/usage.ts";
+import { compactionLine, contextDiagnostics, effectiveContextTokens, usageDecision, usageInputs } from "../src/usage.ts";
 import { prepareBoundaryCompaction } from "../src/boundary.ts";
 import { replay } from "./tool-result-pruner.ts";
 import { textTokens } from "../src/estimate.ts";
@@ -70,6 +70,23 @@ export default function piCompact(pi: ExtensionAPI) {
     }
     return { s, d, base, sub, sessionId };
   }
+
+  pi.registerCommand("context", {
+    description: "Inspect provider-aware context size and calibration",
+    handler: async (_args, ctx) => {
+      const branch = ctx.sessionManager.getBranch();
+      const details = contextDiagnostics(branch);
+      const { total, window, reserve, ratio } = inputs(ctx);
+      const number = (n: number) => Math.round(n).toLocaleString("en-US");
+      const line = window ? compactionLine(window, reserve, ratio) : undefined;
+      const fit = details.calibration;
+      ctx.ui.notify([
+        `anchor=${details.anchor ? number(details.anchor.tokens) : "none"} age=${details.age} turns | delta=${number(details.delta)} savings=${number(details.savings)}`,
+        `cal cjk=${fit.cjk.toFixed(3)}${fit.cjkLearned ? "" : "(prior)"} other=${fit.other.toFixed(3)}${fit.otherLearned ? "" : "(prior)"} n=${fit.observations} (${details.applied ? "calibrated" : "fallback"})`,
+        `effective(A+B)=${number(total)} / ${window ? number(window) : "unknown"} (${window ? (total / window * 100).toFixed(1) + "%" : "unknown"}) line=${line === undefined ? "unknown" : number(line)} distance=${line === undefined ? "unknown" : number(line - total)}`,
+      ].join("\n"), "info");
+    },
+  });
 
   pi.on("session_before_compact", async (event, ctx) => {
     const { s, d, base, sub, sessionId } = guard(ctx, event.reason, event.preparation.tokensBefore);

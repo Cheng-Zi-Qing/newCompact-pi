@@ -27,7 +27,7 @@ function fixture(total = 965_689, toolSize = 60_000, sub = false, config: any = 
   manager.appendMessage(assistant(total) as any);
   const handlers: Record<string, Function[]> = {};
   const complete = mock(async () => ({ stopReason: "stop", content: [{ type: "text", text: snapshot }] }));
-  const pi: any = { on: (name: string, handler: Function) => (handlers[name] ??= []).push(handler), registerTool() {},
+  const pi: any = { on: (name: string, handler: Function) => (handlers[name] ??= []).push(handler), registerTool() {}, registerCommand() {},
     getSettings: () => ({ compaction: { keepRecentTokens: 1000 }, ...config }), getActiveTools: () => ["read_tool_result"],
     appendEntry: mock((type: string, data: any) => manager.appendCustomEntry(type, data)) };
   const ctx: any = { cwd: root, model: { id: "test", provider: "test", api: "openai-completions", contextWindow: 1_000_000, reasoning: true },

@@ -14,8 +14,9 @@ const { SECTIONS } = await import("../src/summary.ts");
 const { resetStates, stateOf } = await import("../src/guard.ts");
 
 function fakePi(activeTools = ["read_tool_result"], settings: any = {}) {
-  const handlers: Record<string, Function> = {}; const tools: Record<string, any> = {}; const actions: any[] = [];
-  return { handlers, tools, actions, on: (n: string, h: Function) => { handlers[n] = h; }, registerTool: (t: any) => { tools[t.name] = t; },
+  const handlers: Record<string, Function> = {}; const tools: Record<string, any> = {}; const actions: any[] = []; const commands: Record<string, any> = {};
+  return { handlers, tools, actions, commands, on: (n: string, h: Function) => { handlers[n] = h; }, registerTool: (t: any) => { tools[t.name] = t; },
+    registerCommand: (name: string, command: any) => { commands[name] = command; },
     getActiveTools: () => activeTools, getSettings: () => settings,
     appendEntry: (customType: string, data: any) => actions.push({ kind: "appendEntry", customType, data }) } as any;
 }
@@ -93,6 +94,25 @@ describe("compact entry wiring", () => {
     ctx.isIdle = () => true;
     return { pi, ctx };
   }
+  test("/context reports numeric diagnostics without including conversation content", async () => {
+    const { pi, ctx } = setup(undefined);
+    const sm = SessionManager.inMemory("/tmp");
+    sm.appendMessage({ role: "assistant", content: [{ type: "text", text: "DO_NOT_DISPLAY_THIS_CONTENT" }], stopReason: "stop", api: "x", provider: "p", model: "m", timestamp: 1,
+      usage: { input: 120_000, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 120_000 } } as any);
+    ctx.sessionManager.getBranch = () => sm.getBranch();
+    await pi.commands.context.handler("", ctx);
+    const text = ctx.ui.notify.mock.calls.at(-1)[0];
+    expect(text).toContain("anchor=120,000");
+    expect(text).toContain("age=0 turns");
+    expect(text).toContain("delta=0");
+    expect(text).toContain("savings=0");
+    expect(text).toContain("cjk=0.250");
+    expect(text).toContain("other=0.250");
+    expect(text).toContain("n=0");
+    expect(text).toContain("line=102,400");
+    expect(text).toContain("distance=-17,600");
+    expect(text).not.toContain("DO_NOT_DISPLAY_THIS_CONTENT");
+  });
   test("success returns our compaction; model error falls back (undefined, not cancel)", async () => {
     let { pi, ctx } = setup({ stopReason: "stop", content: [{ type: "text", text: snapshot }] });
     expect((await pi.handlers.session_before_compact(event(), ctx)).compaction.summary).toContain("## Goal");

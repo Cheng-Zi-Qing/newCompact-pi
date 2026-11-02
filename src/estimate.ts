@@ -3,7 +3,7 @@ import { calculateContextTokens, estimateTokens } from "@earendil-works/pi-codin
 
 // Public-API copy of pi's internal estimateProjectedContextTokens (not exported).
 // tests/estimate.consistency.test.ts compares it with the installed internal one; rerun after every pi upgrade.
-export function estimateProjectedTokens(projection: any, branchEntries: any[]): number {
+export function estimateProjectedTokens(projection: any, branchEntries: any[], estimate = estimateTokens): number {
   const messages = projection.messages as any[];
   let usageIndex = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -20,13 +20,13 @@ export function estimateProjectedTokens(projection: any, branchEntries: any[]): 
     const invalidating = branchEntries.findLastIndex(e => e.type === "context_edit" || e.type === "compaction");
     if (usageEntryIndex > invalidating) {
       let tokens = calculateContextTokens(messages[usageIndex].usage);
-      for (let i = usageIndex + 1; i < messages.length; i++) tokens += estimateTokens(messages[i]);
+      for (let i = usageIndex + 1; i < messages.length; i++) tokens += estimate(messages[i]);
       return tokens;
     }
   }
   const system = getCurrentSystemMessage(messages);
-  let tokens = system ? estimateTokens(system as any) : 0;
-  for (const m of messages) if (m.role !== "system") tokens += estimateTokens(m);
+  let tokens = system ? estimate(system as any) : 0;
+  for (const m of messages) if (m.role !== "system") tokens += estimate(m);
   return tokens;
 }
 
