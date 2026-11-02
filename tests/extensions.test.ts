@@ -11,6 +11,7 @@ const { isSubagent, log, usageDelay } = await import("../extensions/compact.ts")
 usageDelay.ms = 0;
 const tick = () => new Promise(r => setTimeout(r, 5));
 const { SECTIONS } = await import("../src/summary.ts");
+const { pruneText, KEEP_LIMIT } = await import("../extensions/tool-result-pruner.ts");
 const { resetStates, stateOf } = await import("../src/guard.ts");
 
 function fakePi(activeTools = ["read_tool_result"], settings: any = {}) {
@@ -77,6 +78,20 @@ describe("tool-result pruner", () => {
     const pi = fakePi(["read", "bash"]); pruner(pi);
     const { sm, ctx } = session(many());
     expect(await pi.handlers.turn_end(turnEnd(sm), ctx)).toBeUndefined();
+  });
+  test("pruneText keeps exactly-KEEP_LIMIT intact, prunes one codepoint more", () => {
+    expect(pruneText("a".repeat(KEEP_LIMIT), "e1")).toBeUndefined();
+    const out = pruneText(`HEAD${"m".repeat(KEEP_LIMIT)}TAIL`, "e1")!;
+    expect(out).toContain("[tool_result pruned; raw entry e1; use read_tool_result]");
+    expect(out.startsWith("HEADmmm")).toBe(true);
+    expect(out.endsWith("TAIL")).toBe(true);
+    expect(Array.from(out).length).toBeLessThan(KEEP_LIMIT + 100);
+  });
+  test("pruneText slices by codepoint, never producing a lone surrogate", () => {
+    const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+    const out = pruneText(`${"🙂".repeat(KEEP_LIMIT)}${"尾".repeat(50)}`, "e2")!;
+    expect(lone.test(out)).toBe(false);
+    expect(Array.from(out).length).toBeLessThan(Array.from("🙂".repeat(KEEP_LIMIT) + "尾".repeat(50)).length);
   });
 });
 

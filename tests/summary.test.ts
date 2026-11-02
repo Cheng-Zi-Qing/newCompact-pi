@@ -2,13 +2,14 @@ import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { convertToLlm } from "@earendil-works/pi-coding-agent";
 
 const tmp = mkdtempSync(path.join(os.tmpdir(), "pi-compact-test-"));
 process.env.PI_COMPACT_DIR = tmp;
 const prodLog = path.join(os.homedir(), ".pi/agent/pi-compact.log");
 const prodLogBefore = existsSync(prodLog) ? statSync(prodLog).mtimeMs : null;
 
-const { summarize, SECTIONS, Fallback, archivePath, dataDir, taskBrief, HARD_CAP } = await import("../src/summary.ts");
+const { summarize, SECTIONS, Fallback, archivePath, dataDir, taskBrief, HARD_CAP, BRIEF_CAP, serializeForSummary, SUMMARY_PROFILE, checkStructure, insertBrief } = await import("../src/summary.ts");
 const { textTokens } = await import("../src/estimate.ts");
 
 const model = { id: "m", provider: "p", api: "openai-responses", reasoning: true, contextWindow: 128000, maxTokens: 16384 };
@@ -53,6 +54,13 @@ describe("summarize", () => {
     expect(out.compaction.summary).toContain(`Older details: ${archivePath(i.sessionId)}`);
     expect(calls[0].opts).toMatchObject({ maxTokens: 12288, reasoning: "low", cacheRetention: "none" });
     expect(readFileSync(archivePath(i.sessionId), "utf8")).toContain("OLD SUMMARY");
+  });
+  test("restorable pointer block, still exactly 8 headings", async () => {
+    const i = input([reply(snapshot())]);
+    const out = await summarize(i);
+    expect(out.compaction.summary).toContain("read_tool_result(entryId, offset, limit)");
+    expect(out.compaction.summary).toContain(archivePath(i.sessionId));
+    expect(out.compaction.summary.split("\n").filter(l => l.startsWith("## ")).length).toBe(8);
   });
   test("stop:length -> fallback", async () => { await fails(summarize(input([reply(snapshot(), "length")])), "stop:length"); });
   test("missing / reordered section -> fallback", async () => {
@@ -108,6 +116,136 @@ describe("summarize", () => {
   });
 });
 
+describe("serializeForSummary", () => {
+  test("prefixes and blank-line separation match pi's conversation format", () => {
+    const text = serializeForSummary([
+      user("hello"),
+      { role: "assistant", content: [{ type: "text", text: "working" }, { type: "toolCall", name: "read", arguments: { path: "/a.ts" } }] },
+      { role: "toolResult", toolName: "read", content: [{ type: "text", text: "file body" }] },
+    ]);
+    expect(text).toBe("[User]: hello\n\n[Assistant]: working\n\n[Assistant tool calls]: read(path=/a.ts)\n\n[Tool result]: file body");
+  });
+  test("user text is never truncated", () => {
+    const long = "u".repeat(10000);
+    expect(serializeForSummary([user(long)])).toBe(`[User]: ${long}`);
+  });
+  test("assistant text is capped per profile, thinking is dropped", () => {
+    const msg = { role: "assistant", content: [{ type: "thinking", thinking: "secret reasoning" }, { type: "text", text: "t".repeat(9000) }] };
+    const full = serializeForSummary([msg], "full"), tight = serializeForSummary([msg], "tight");
+    expect(full).not.toContain("secret reasoning");
+    expect(full).toContain(`[+${9000 - SUMMARY_PROFILE.full.text} chars]`);
+    expect(tight).toContain(`[+${9000 - SUMMARY_PROFILE.tight.text} chars]`);
+    expect(tight.length).toBeLessThan(full.length);
+  });
+  test("toolCall args are capped; command gets its own bigger cap; objects are stringified first", () => {
+    const msg = { role: "assistant", content: [{ type: "toolCall", name: "bash", arguments: { command: "c".repeat(2000), edits: [{ oldText: "o".repeat(900) }] } }] };
+    const full = serializeForSummary([msg], "full");
+    expect(full).toContain(`[+${2000 - SUMMARY_PROFILE.full.command} chars]`);
+    expect(full).toContain(`[+${JSON.stringify([{ oldText: "o".repeat(900) }]).length - SUMMARY_PROFILE.full.args} chars]`);
+    expect(serializeForSummary([msg], "tight")).toContain(`[+${2000 - SUMMARY_PROFILE.tight.command} chars]`);
+  });
+  test("tool results keep head and tail, with the dropped middle marked", () => {
+    const body = `HEAD${"m".repeat(1000)}TAIL`;
+    const text = serializeForSummary([{ role: "toolResult", toolName: "bash", content: [{ type: "text", text: body }] }]);
+    expect(text.startsWith("[Tool result]: HEADmmm")).toBe(true);
+    expect(text.endsWith("TAIL")).toBe(true);
+    expect(text).toContain(`[+${body.length - SUMMARY_PROFILE.full.resultHead - SUMMARY_PROFILE.full.resultTail} chars]`);
+  });
+  test("short tool results are untouched", () => {
+    expect(serializeForSummary([{ role: "toolResult", content: "small" }])).toBe("[Tool result]: small");
+  });
+  test("projected roles (bashExecution, custom) survive via convertToLlm", () => {
+    const projected = [{ role: "user", content: "hi" }, { role: "bashExecution", command: "ls", output: "a\nb", exitCode: 0 }, { role: "custom", content: "injected note" }];
+    const text = serializeForSummary(convertToLlm(projected));
+    expect(text).toContain("Ran `ls`");
+    expect(text).toContain("a\nb");
+    expect(text).toContain("injected note");
+  });
+  test("no messages -> empty string", () => {
+    expect(serializeForSummary([])).toBe("");
+  });
+  test("unknown roles are dropped", () => {
+    expect(serializeForSummary([{ role: "system", content: "sys prompt" }, user("hi")])).toBe("[User]: hi");
+  });
+  test("assistant with only tool calls emits no [Assistant]: line", () => {
+    const text = serializeForSummary([{ role: "assistant", content: [{ type: "toolCall", name: "read", arguments: { path: "/a" } }] }]);
+    expect(text).toBe("[Assistant tool calls]: read(path=/a)");
+  });
+  test("toolCall without arguments renders name()", () => {
+    expect(serializeForSummary([{ role: "assistant", content: [{ type: "toolCall", name: "ls", arguments: undefined }] }])).toBe("[Assistant tool calls]: ls()");
+  });
+  test("truncation never leaves a lone surrogate", () => {
+    const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+    const shapes = ["a".repeat(9000), "汉字".repeat(4000), `x${"🙂".repeat(400)}`, "🙂a".repeat(500), `${"y".repeat(400)} ${"🙂".repeat(200)}`];
+    for (const profile of ["full", "tight"] as const) for (const text of shapes) {
+      const tool = serializeForSummary([{ role: "toolResult", content: [{ type: "text", text }] }], profile);
+      const assistant = serializeForSummary([{ role: "assistant", content: [{ type: "text", text }] }], profile);
+      const arg = serializeForSummary([{ role: "assistant", content: [{ type: "toolCall", name: "bash", arguments: { command: text, edits: [text] } }] }], profile);
+      expect(lone.test(tool + assistant + arg)).toBe(false);
+    }
+  });
+});
+
+describe("capacity degrade", () => {
+  const big = () => ({ role: "assistant", content: [{ type: "text", text: "y".repeat(5000) }] });
+  const flood = (n: number) => ({ preparation: { messagesToSummarize: [user("go"), ...Array.from({ length: n }, big)], turnPrefixMessages: [],
+    firstKeptEntryId: "aaaaaaaa", tokensBefore: 90000, previousSummary: "OLD SUMMARY", fileOps: {} } });
+  test("full over capacity, tight fits -> one call, compressed flag, no fallback", async () => {
+    const i = input([reply(snapshot())], { ...flood(100), model: { ...model, contextWindow: 120000 } });
+    const out = await summarize(i);
+    expect(out.compressed).toBe(true);
+    expect(calls.length).toBe(1);
+    // tight truncated the 5000-char texts at 1200 chars, i.e. the second profile was the one sent
+    expect(calls[0].ctx.messages[0].content[0].text).toContain(`[+${5000 - SUMMARY_PROFILE.tight.text} chars]`);
+    expect(out.compaction.summary).toContain("## Goal");
+  });
+  test("both profiles over capacity -> fallback without calling the model", async () => {
+    const i = input([reply(snapshot())], { ...flood(1000), model: { ...model, contextWindow: 120000 } });
+    await fails(summarize(i), "capacity");
+    expect(calls.length).toBe(0);
+  });
+  test("full fits -> compressed stays false", async () => {
+    const out = await summarize(input([reply(snapshot())], { model }));
+    expect(out.compressed).toBe(false);
+  });
+  test("no window on either the model or the session -> no capacity fallback", async () => {
+    const out = await summarize(input([reply(snapshot())], { model: { ...model, contextWindow: undefined }, contextWindow: undefined }));
+    expect(out.compressed).toBe(false);
+    expect(out.compaction.summary).toContain("## Next Steps");
+  });
+  test("tight then condense: compressed stays true", async () => {
+    const out = await summarize(input([reply(snapshot("word ".repeat(8000))), reply(snapshot())], { ...flood(100), model: { ...model, contextWindow: 120000 } }));
+    expect(calls.length).toBe(2);
+    expect(out.compressed).toBe(true);
+    expect(out.condensed).toBe(true);
+  });
+});
+
+describe("structure tolerance", () => {
+  test("an extra unknown section is ignored", () => {
+    expect(() => checkStructure(`${snapshot()}\n\n## Notes\nwhatever`)).not.toThrow();
+  });
+  test("headings inside a fenced code block do not count", () => {
+    const text = snapshot().replace("## Key Decisions\nx", "## Key Decisions\n```\n## Goal\n## Notes\n```");
+    expect(() => checkStructure(text)).not.toThrow();
+    expect(() => checkStructure(snapshot("```\n## Goal\n```"))).not.toThrow();
+  });
+  test("trailing spaces and CRLF on headings are tolerated", () => {
+    expect(() => checkStructure(SECTIONS.map(s => `## ${s}   \r\nx`).join("\r\n"))).not.toThrow();
+  });
+  test("a renamed section still falls back", () => {
+    const text = snapshot().replace("## Key Decisions", "## Decisions");
+    expect(() => checkStructure(text)).toThrow(Fallback);
+  });
+  test("a duplicated section counts once, so a missing one still falls back", () => {
+    expect(() => checkStructure(snapshot() + `\n\n## Goal\nagain`)).not.toThrow();
+    expect(() => checkStructure(snapshot().replace("## Next Steps", "## Goal"))).toThrow(Fallback);
+  });
+  test("a snapshot wrapped entirely in a code fence has no headings left", () => {
+    expect(() => checkStructure(`\`\`\`markdown\n${snapshot()}\n\`\`\``)).toThrow(Fallback);
+  });
+});
+
 describe("subagent task brief", () => {
   const entries = (brief: string) => [{ type: "message", id: "11111111", message: user(brief) }];
   test("brief kept verbatim in Goal", async () => {
@@ -122,7 +260,7 @@ describe("subagent task brief", () => {
     expect(calls[0].ctx.systemPrompt).toContain("Authorization & Constraints: 300");
   });
   test("snapshot under 8k but over after adding brief + pointer -> condense once, then succeed", async () => {
-    const brief = "brief ".repeat(1500).trim(); // ~1.9k tokens, under the 2k brief cap
+    const brief = "brief ".repeat(1200).trim(); // ~1.8k tokens, under the 2k brief cap (in-memory is capped too now)
     const raw = snapshot("word ".repeat(6400 / 8 * 4 / 5)); // ~6.4k tokens on its own
     const out = await summarize(input([reply(raw), reply(snapshot())], { isSubagent: true, branchEntries: entries(brief) }));
     expect(calls.length).toBe(2);
@@ -135,15 +273,67 @@ describe("subagent task brief", () => {
     expect(text).toContain("[truncated; full brief: /s/file.jsonl entry 11111111]");
     expect(textTokens(text)).toBeLessThan(2200);
   });
-  test("long brief on an in-memory session: kept whole", () => {
-    const brief = "长任务说明".repeat(500);
-    expect(taskBrief(entries(brief), undefined)).toContain(brief);
+  test("long brief on an in-memory session: truncated with an honest marker", () => {
+    const brief = "长任务说明".repeat(3000);
+    const text = taskBrief(entries(brief), undefined)!;
+    expect(text).toContain("[truncated; in-memory session, full text is not addressable]");
+    expect(text).not.toContain("full brief:");
+    expect(textTokens(text)).toBeLessThanOrEqual(BRIEF_CAP + 100); // marker text is not budget
+  });
+  test("in-memory with a huge first message: one model call, no over-cap fallback", async () => {
+    const brief = "长任务说明".repeat(3000);
+    const out = await summarize(input([reply(snapshot())], { isSubagent: true, branchEntries: entries(brief) }));
+    expect(calls.length).toBe(1);
+    expect(out.condensed).toBe(false);
+    expect(out.compaction.summary).toContain("## Next Steps");
+  });
+  test("insertBrief handles a Goal heading on the last line without a newline", () => {
+    expect(insertBrief("## Goal", "BRIEF")).toBe("## Goal\nBRIEF\n\n");
+    expect(insertBrief("## Goals\nx", "BRIEF")).toBe("## Goals\nx");
+  });
+  test("first user message with no text (image only) -> no brief block, snapshot still produced", async () => {
+    const entries_ = [{ type: "message", id: "33333333", message: { role: "user", content: [{ type: "image", data: "AAAA", mimeType: "image/png" }] } }];
+    expect(taskBrief(entries_, undefined)).toBeUndefined();
+    const out = await summarize(input([reply(snapshot())], { isSubagent: true, branchEntries: entries_ }));
+    expect(out.compaction.summary).not.toContain("Task brief (verbatim");
+    expect(out.compaction.summary).toContain("## Goal");
+  });
+  test("insertBrief tolerates trailing spaces and CRLF", async () => {
+    const brief = "verbatim brief";
+    const raw = snapshot().replace("## Goal", "## Goal   ").replace(/\n/g, "\r\n");
+    const out = await summarize(input([reply(raw)], { isSubagent: true, branchEntries: entries(brief) }));
+    expect(out.compaction.summary).toContain(`## Goal\nTask brief (verbatim, from parent):`);
+    expect(out.compaction.summary).toContain(brief);
   });
   test("tight 3k budget: brief untouched, prompt budget shrinks", async () => {
     const brief = "brief ".repeat(300).trim();
     const out = await summarize(input([reply(snapshot())], { isSubagent: true, branchEntries: entries(brief), budget: 3000 }));
     expect(out.compaction.summary).toContain(brief);
     expect(calls[0].ctx.systemPrompt).toContain("<= 2400 tokens");
+  });
+});
+
+describe("main session original request", () => {
+  const entries = (request: string) => [{ type: "message", id: "22222222", message: user(request) }];
+  test("first user message kept verbatim as the original request", async () => {
+    const request = "Build X in /a/b.ts; run bun test; do not push.";
+    const out = await summarize(input([reply(snapshot())], { isSubagent: false, branchEntries: entries(request) }));
+    const goal = out.compaction.summary.split("## Authorization")[0];
+    expect(goal).toContain("Original request (verbatim, from user):");
+    expect(goal).toContain(request);
+    expect(out.compaction.summary).not.toContain("Task brief (verbatim, from parent)");
+  });
+  test("no first user message -> no request block", async () => {
+    const out = await summarize(input([reply(snapshot())], { isSubagent: false }));
+    expect(out.compaction.summary).not.toContain("Original request (verbatim");
+  });
+  test("the verbatim request comes out of the snapshot budget, so no condense call", async () => {
+    const request = "word ".repeat(1500).trim(); // ~1.9k tokens
+    const out = await summarize(input([reply(snapshot())], { isSubagent: false, branchEntries: entries(request) }));
+    expect(calls.length).toBe(1);
+    expect(out.condensed).toBe(false);
+    expect(calls[0].ctx.systemPrompt).not.toContain("<= 6000 tokens");
+    expect(calls[0].ctx.systemPrompt).toMatch(/Total budget: <= 4\d{3} tokens/);
   });
 });
 

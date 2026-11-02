@@ -99,9 +99,10 @@ export default function piCompact(pi: ExtensionAPI) {
         contextWindow: ctx.getContextUsage()?.contextWindow,
         sessionId, sessionFile: ctx.sessionManager.getSessionFile(), isSubagent: sub, budget: d.budget,
       });
-      log({ ...base, streak: d.streak, budget: d.budget, summaryTokens: out.tokens, result: out.condensed ? "condensed" : "ok" });
+      log({ ...base, streak: d.streak, budget: d.budget, summaryTokens: out.tokens, result: out.condensed ? "condensed" : out.compressed ? "compressed" : "ok" });
       return { compaction: out.compaction };
     } catch (error) {
+      s.compacting = false; // pi's session_compact_failed also clears it, but a hook that never reaches pi must not wedge the session
       log({ ...base, streak: d.streak, result: `fallback:${error instanceof Fallback ? error.message : "error"}` });
       return; // pi runs its native summary; never cancel here
     }
