@@ -1,10 +1,10 @@
 import { Type } from "typebox";
 import { convertToLlm, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { compactionLine, effectiveContextTokens, getTriggerRatio } from "../src/usage.ts";
 import { estimateProjectedTokens } from "../src/estimate.ts";
 
-// Migrated from ~/.pi/agent/experiments/tool-result-pruner.ts; behaviour unchanged except public imports
-// and skipping sessions where read_tool_result is not an active tool (pruned text would be unrecoverable).
+// Raw history stays retrievable; pruning and compaction share the provider-aware trigger line.
 const integer = (n: unknown): n is number => typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
 const warning = "Tool-result pruning skipped: invalid context or compaction settings.";
 export const KEEP_LIMIT = 8192, HEAD = 4096, TAIL = 1024;
@@ -69,18 +69,18 @@ export default function toolResultPruner(pi: ExtensionAPI) {
       if (!integer(window) || window === 0 || typeof settings.enabled !== "boolean" || !integer(settings.reserveTokens) ||
         !integer(settings.keepRecentTokens) || settings.reserveTokens >= window) throw new Error("Invalid settings");
       if (!settings.enabled) return;
-      const threshold = window - settings.reserveTokens;
+      const threshold = compactionLine(window, settings.reserveTokens, getTriggerRatio(effective));
       const entries = [...event.entries];
       let preview = replay(ctx, entries);
       const estimate = () => {
-        const n = estimateProjectedTokens(preview.buildSessionProjection(), preview.getBranch());
+        const n = effectiveContextTokens(preview.getBranch(), preview.buildSessionProjection());
         if (!integer(n)) throw new Error("Invalid estimate");
         return n;
       };
       if (estimate() <= threshold) return;
       const projected = event.context.contextEntries;
       const lastUser = projected.findLastIndex((entry: any) => convertToLlm(entry.messages).some((message: any) => message.role === "user"));
-      // shortcut: turn_end only and the whole latest user span is excluded; startup/current-span pressure remains native compaction's job.
+      // The newest user span is kept raw; the later compact boundary handler can summarize its prefix safely.
       if (lastUser < 0) return;
       for (const entry of projected.slice(0, lastUser)) {
         const message = entry.messages[0];

@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { BUDGET, busy, committed, decide, failed, FAIL_LIMIT, resetStates, stateOf, TIGHT_BUDGET } from "../src/guard.ts";
-import { freshUsageTotal, THROTTLE_MS, usageDecision } from "../src/usage.ts";
+import { effectiveContextTokens, freshUsageTotal, getTriggerRatio, THROTTLE_MS, usageDecision, compactionLine } from "../src/usage.ts";
 
 beforeEach(resetStates);
 const T = 1_000_000;
@@ -102,10 +102,35 @@ describe("state isolation", () => {
 
 describe("usage fallback", () => {
   const s = () => stateOf("u");
-  test("threshold follows reserve", () => {
-    expect(usageDecision(s(), 111_616, 128_000, 16384, true, T)).toBe("small");
-    expect(usageDecision(s(), 111_617, 128_000, 16384, true, T)).toBe("trigger");
+  test("compaction line uses the earlier ratio/reserve boundary", () => {
+    for (const [window, expected] of [[1_000_000, 800_000], [200_000, 160_000], [128_000, 102_400], [32_000, 16_000]]) {
+      const reserve = window === 32_000 ? 16_000 : 16384;
+      expect(compactionLine(window, reserve, 0.8)).toBe(expected);
+      expect(usageDecision(s(), expected, window, reserve, true, T)).toBe("small");
+      expect(usageDecision(s(), expected + 1, window, reserve, true, T)).toBe("trigger");
+    }
+    expect(compactionLine(32_000, 16384, 0.8)).toBe(15_616);
+    expect(compactionLine(1_000_001, 16384, 0.8)).toBe(800_000);
+    expect(compactionLine(128_000, 16384, 0.95)).toBe(111_616);
+    expect(usageDecision(s(), 965_689, 1_000_000, 16384, true, T)).toBe("trigger");
     expect(usageDecision(s(), 70_000, 128_000, 65536, true, T)).toBe("trigger");
+  });
+  test("trigger ratio accepts only finite numbers from 0.5 to 0.95", () => {
+    for (const ratio of [0.5, 0.8, 0.95]) expect(getTriggerRatio({ piCompact: { triggerRatio: ratio } })).toBe(ratio);
+    expect(getTriggerRatio({})).toBe(0.8);
+    for (const ratio of [null, "0.8", NaN, Infinity, 0.49, 0.96]) {
+      let warnings = 0;
+      expect(getTriggerRatio({ piCompact: { triggerRatio: ratio } }, () => warnings++)).toBe(0.8);
+      expect(warnings).toBe(1);
+    }
+  });
+  test("window no larger than reserve has no usable data", () => {
+    for (const [window, reserve] of [[16384, 16384], [128_000, 200_000]]) {
+      expect(compactionLine(window, reserve, 0.8)).toBeLessThanOrEqual(0);
+      expect(usageDecision(s(), 1, window, reserve, true, T)).toBe("no-data");
+    }
+    expect(usageDecision(s(), undefined, 1_000_000, 16384, true, T)).toBe("no-data");
+    expect(usageDecision(s(), 965_689, undefined, 16384, true, T)).toBe("no-data");
   });
   test("auto-compaction disabled in settings -> never triggers", () => {
     expect(usageDecision(s(), 127_000, 128_000, 16384, false, T)).toBe("disabled");

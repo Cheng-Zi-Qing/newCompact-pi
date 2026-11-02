@@ -1,9 +1,11 @@
 import { appendFileSync, existsSync, mkdirSync, renameSync, statSync } from "node:fs";
 import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { committed, decide, dropState, failed, stateOf } from "../src/guard.ts";
+import { busy, committed, decide, dropState, failed, stateOf } from "../src/guard.ts";
 import { dataDir, Fallback, summarize } from "../src/summary.ts";
-import { usageDecision, usageInputs } from "../src/usage.ts";
+import { compactionLine, effectiveContextTokens, usageDecision, usageInputs } from "../src/usage.ts";
+import { prepareBoundaryCompaction } from "../src/boundary.ts";
+import { replay } from "./tool-result-pruner.ts";
 import { textTokens } from "../src/estimate.ts";
 
 const STATUS = "pi-compact";
@@ -34,12 +36,20 @@ const WHY_TEXT = {
 } as const;
 
 export default function piCompact(pi: ExtensionAPI) {
-  pi.on("session_before_compact", async (event, ctx) => {
+  function inputs(ctx: any, manager = ctx.sessionManager) {
+    return usageInputs(pi, ctx, manager, () => {
+      const s = stateOf(ctx.sessionManager.getSessionId());
+      if (s.ratioWarned) return;
+      s.ratioWarned = true;
+      try { ctx.ui.notify("Invalid piCompact.triggerRatio: expected a number from 0.5 to 0.95; using 0.8.", "warning"); } catch { /* optional UI */ }
+    });
+  }
+  function guard(ctx: any, reason: any, tokensBefore: number) {
     const sessionId = ctx.sessionManager.getSessionId();
     const s = stateOf(sessionId);
     const sub = isSubagent(ctx);
-    const d = decide(s, event.reason, sub, Date.now());
-    const base = { session: sessionId, sub, reason: d.reason, tokensBefore: event.preparation.tokensBefore, failStreak: s.failStreak };
+    const d = decide(s, reason, sub, Date.now());
+    const base = { session: sessionId, sub, reason: d.reason, tokensBefore, failStreak: s.failStreak };
     if (d.action === "cancel") {
       log({ ...base, result: `cancel:${d.why ?? "paused"}` });
       // Status stays visible; the warning is shown once per pause, not on every turn.
@@ -47,7 +57,7 @@ export default function piCompact(pi: ExtensionAPI) {
         ctx.ui.setStatus(STATUS, "Auto-compaction paused; run /compact or start a new session");
         if (d.justPaused && d.why) ctx.ui.notify(`Auto-compaction paused: ${WHY_TEXT[d.why]}. Run /compact or start a new session; context will keep growing until then.`, "warning");
       } catch { /* UI is optional */ }
-      return { cancel: true };
+      return { s, d, base, sub, sessionId };
     }
     if (d.action === "abort") {
       s.paused = true; // blocks the usage fallback from re-compacting the stopped run; the next successful compaction clears it
@@ -57,8 +67,14 @@ export default function piCompact(pi: ExtensionAPI) {
       try { pi.appendEntry(ABORT_ENTRY, { reason, sessionId, streak: d.streak, failStreak: s.failStreak }); } catch { /* abort still stops it */ }
       try { ctx.ui.notify(`pi-compact: ${WHY_TEXT[d.why]} in subagent; stopping this run so the parent can decide.`, "error"); } catch { /* optional */ }
       ctx.abort();
-      return { cancel: true };
     }
+    return { s, d, base, sub, sessionId };
+  }
+
+  pi.on("session_before_compact", async (event, ctx) => {
+    const { s, d, base, sub, sessionId } = guard(ctx, event.reason, event.preparation.tokensBefore);
+    if (d.action !== "run") return { cancel: true };
+    s.compacting = true;
     try {
       const out = await summarize({
         preparation: event.preparation, branchEntries: event.branchEntries, customInstructions: event.customInstructions,
@@ -77,6 +93,7 @@ export default function piCompact(pi: ExtensionAPI) {
   pi.on("session_compact", (event, ctx) => {
     const s = stateOf(ctx.sessionManager.getSessionId());
     const reason = committed(s, Date.now());
+    s.compacting = false;
     if (reason && reason !== "manual" && isSubagent(ctx)) s.paused = false; // a successful compaction ends a subagent's post-abort block
     log({ session: ctx.sessionManager.getSessionId(), reason: reason ?? `untracked:${event.reason}`, result: "committed",
       fromExtension: event.fromExtension, summaryTokens: textTokens(event.compactionEntry.summary ?? "") });
@@ -85,33 +102,80 @@ export default function piCompact(pi: ExtensionAPI) {
   pi.on("session_compact_failed", (event, ctx) => {
     const s = stateOf(ctx.sessionManager.getSessionId());
     const reason = failed(s, event.aborted);
+    s.compacting = false;
     log({ session: ctx.sessionManager.getSessionId(), reason: reason ?? `untracked:${event.reason}`, result: "commit-failed",
       aborted: event.aborted, fromExtension: event.fromExtension, failStreak: s.failStreak,
       error: JSON.stringify((event.errorMessage ?? "").slice(0, 120)) });
   });
   pi.on("session_shutdown", (_event, ctx) => { try { dropState(ctx.sessionManager.getSessionId()); } catch { /* stale ctx */ } });
 
-  // Fallback when provider-reported usage crosses the threshold. Only at agent_end: mid tool-loop compaction discards needed work.
+  // Manifest order is pruner first: event.entries already includes its proposed edits.
+  pi.on("turn_end", async (event, ctx) => {
+    if (event.outcome !== "completed") return;
+    const s = stateOf(ctx.sessionManager.getSessionId());
+    const base = { session: ctx.sessionManager.getSessionId(), sub: isSubagent(ctx) };
+    const skip = (why: string) => { log({ ...base, result: `boundary-skip:${why}` }); };
+    let attempted = false;
+    const signal = ctx.signal ?? new AbortController().signal;
+    try {
+      if (s.compacting || busy(s, Date.now()) || s.usagePending) return skip("busy");
+      if (event.entries.some(e => e.type === "compaction")) return skip("compacted");
+      const preview = replay(ctx, event.entries);
+      const { total, window, reserve, keepRecent, enabled, ratio } = inputs(ctx, preview);
+      if (!enabled) return skip("disabled");
+      if (!Number.isSafeInteger(window) || window <= 0 || !Number.isSafeInteger(reserve) || reserve < 0 ||
+        !Number.isSafeInteger(keepRecent) || keepRecent < 0 || !Number.isFinite(total)) return skip("no-data");
+      const line = compactionLine(window, reserve, ratio);
+      if (line <= 0 || total <= line) return skip("small");
+      if (s.paused) return skip("paused");
+      const preparation = prepareBoundaryCompaction(preview, keepRecent, total);
+      if (!preparation) return skip("nothing-to-compact");
+      const { d } = guard(ctx, "threshold", total);
+      if (d.action !== "run") return skip(d.action === "abort" ? "abort" : "paused");
+      attempted = true;
+      s.compacting = true;
+      const out = await summarize({ preparation, branchEntries: preview.getBranch(), signal, model: ctx.model,
+        complete: (m, c, o) => ctx.modelRegistry.streamSimple(m, c, o).result(), contextWindow: window,
+        sessionId: base.session, sessionFile: ctx.sessionManager.getSessionFile(), isSubagent: base.sub, budget: d.budget });
+      if (signal.aborted) throw new Fallback("aborted");
+      const entries = [...event.entries, { type: "compaction" as const, ...out.compaction }];
+      const compacted = replay(ctx, entries);
+      const after = effectiveContextTokens(compacted.getBranch(), compacted.buildSessionProjection());
+      // Preempt native mid-run compaction only when the refreshed projection is below both lines.
+      if (after >= line) throw new Fallback("no-reduction");
+      // shortcut: boundary drafts have no commit callback; counters assume later handlers accept this validated draft.
+      committed(s, Date.now());
+      log({ ...base, tokensBefore: total, tokensAfter: after, limit: line, summaryTokens: out.tokens, result: "boundary-compact" });
+      return { entries };
+    } catch (error) {
+      if (attempted) failed(s, signal.aborted);
+      log({ ...base, result: `boundary-fallback:${error instanceof Fallback ? error.message : "error"}` });
+    } finally {
+      if (attempted) s.compacting = false;
+    }
+  });
+
+  // Fallback at agent_end: keep idle/throttle rules; boundary compaction is the mid-run path.
   pi.on("agent_end", (_event, ctx) => {
     try {
       const s = stateOf(ctx.sessionManager.getSessionId());
-      const { total, window, reserve, enabled } = usageInputs(pi, ctx);
+      const { total, window, reserve, enabled, ratio } = inputs(ctx);
       const now = Date.now();
-      if (usageDecision(s, total, window, reserve, enabled, now) !== "trigger") return;
+      if (usageDecision(s, total, window, reserve, enabled, now, ratio) !== "trigger") return;
       s.usageLastAttempt = now; // throttle from the first sighting, even if we end up skipping
       // ctx.compact() aborts whatever is running (including an in-flight compaction), so only act once idle.
       setTimeout(() => {
         try {
           const sessionId = ctx.sessionManager.getSessionId();
-          const again = usageInputs(pi, ctx);
+          const again = inputs(ctx);
           // Re-check everything: the guard may have paused/aborted this session after the timer was queued.
-          const d = usageDecision(s, again.total, again.window, again.reserve, again.enabled, Date.now());
+          const d = usageDecision(s, again.total, again.window, again.reserve, again.enabled, Date.now(), again.ratio);
           // Ignore "throttled": this timer's first check just set usageLastAttempt.
           const skip = d === "disabled" || d === "paused" ? d : d === "busy" || !ctx.isIdle() ? "busy"
             : d === "no-data" || d === "small" ? "resolved" : undefined;
           if (skip) { log({ session: sessionId, usageTotal: again.total, result: `usage-skip:${skip}` }); return; }
           s.usagePending = true;
-          log({ session: sessionId, usageTotal: again.total, limit: again.window - again.reserve, result: "usage-trigger" });
+          log({ session: sessionId, usageTotal: again.total, limit: compactionLine(again.window, again.reserve, again.ratio), result: "usage-trigger" });
           ctx.compact({ onError: () => { s.usagePending = false; } }); // e.g. "nothing to compact" before our hook runs
         } catch { /* stale ctx after reload/session switch */ }
       }, usageDelay.ms);

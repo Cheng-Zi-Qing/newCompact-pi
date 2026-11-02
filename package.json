@@ -19,8 +19,8 @@
   },
   "pi": {
     "extensions": [
-      "./extensions/compact.ts",
-      "./extensions/tool-result-pruner.ts"
+      "./extensions/tool-result-pruner.ts",
+      "./extensions/compact.ts"
     ]
   },
   "repository": {
