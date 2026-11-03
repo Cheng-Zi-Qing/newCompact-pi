@@ -135,10 +135,11 @@ export function taskBrief(branchEntries: any[], sessionFile: string | undefined,
   return wrap(text);
 }
 
-export type ArchiveState = "archived" | "none" | "failed";
+export type ArchiveState = "archived" | "none" | "append-failed" | "failed";
 // No heading: these pointers belong after the eight snapshot sections.
 export function restoreBlock(archive: string, state: ArchiveState, hasPruned = false) {
-  const where = state === "archived" ? `older snapshots in ${archive}; ` : state === "failed"
+  const where = state === "archived" ? `older snapshots in ${archive}; ` : state === "append-failed"
+    ? `the latest previous snapshot could not be appended (write failed); older snapshots in ${archive}; ` : state === "failed"
     ? "earlier snapshots were not archived (write failed), so this snapshot is the only record; " : "";
   const results = hasPruned ? "pruned tool results listed below, and markers still visible in kept messages," : "pruned tool-result markers still visible in kept messages";
   return `Restorable: ${where}${results} reopen via read_tool_result(entryId, offset, limit) when that tool is enabled. Newer messages verbatim.`;
@@ -149,13 +150,14 @@ function prunedRestoreList(preparation: any, branch: any[]) {
   if (end < 0) return "";
   const previous = branch.findLast(e => e.type === "compaction");
   const start = previous ? branch.findIndex(e => e.id === previous.firstKeptEntryId) : 0;
-  const summarized = [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages];
+  const summarized = new Set([...preparation.messagesToSummarize, ...preparation.turnPrefixMessages]
+    .filter(m => m.role === "toolResult").map(m => `${m.toolCallId}\u0000${m.toolName}`));
   const edits = new Map<string, any>();
   for (const entry of branch) if (entry.type === "context_edit") edits.set(entry.targetId, entry.replacement);
   const results = branch.slice(Math.max(0, start), end).filter(entry => {
     const message = entry.message;
     if (entry.type !== "message" || message?.role !== "toolResult") return false;
-    if (!summarized.some(m => m.role === "toolResult" && m.toolCallId === message.toolCallId && m.toolName === message.toolName)) return false;
+    if (!summarized.has(`${message.toolCallId}\u0000${message.toolName}`)) return false;
     const replacement = edits.get(entry.id);
     return replacement && textOf(replacement).includes(`[tool_result pruned; raw entry ${entry.id}; use read_tool_result]`);
   }).reverse();
@@ -209,9 +211,17 @@ export async function summarize(input: SummaryInput) {
   const source = (profile: SummaryProfile) => `<previous-summary>\n${preparation.previousSummary ?? "(none)"}\n</previous-summary>\n\n<conversation>\n${serializeForSummary(messages, profile)}\n</conversation>` +
     (input.customInstructions ? `\n\nAdditional focus from the user: ${input.customInstructions}` : "");
   const brief = taskBrief(input.branchEntries, input.sessionFile, isSubagent ? "subagent" : "main");
-  // The context-only first message is charged to the main snapshot budget; subagents use SUB_SHARE instead.
-  const promptBudget = !isSubagent && brief ? Math.max(3000, budget - textTokens(brief)) : budget;
-  const system = prompt(promptBudget, isSubagent);
+  const archive = archivePath(input.sessionId);
+  // Reserve the successful archive pointer before validation; do not write until the whole attempt passes.
+  let archived: ArchiveState = preparation.previousSummary || existsSync(archive) ? "archived" : "none";
+  let restoreList = prunedRestoreList(preparation, input.branchEntries);
+  let olderDetails = true;
+  const tail = () => (olderDetails && archived === "archived" ? `\n\nOlder details: ${archive} (read it only if needed).` : "") +
+    `\n\n${restoreBlock(archive, archived, !!restoreList)}${restoreList}`;
+  const assemble = (text: string) => (brief ? insertBrief(text, brief) : text) + tail();
+  // Main briefs and the current tail come out of the budget; subagent briefs use SUB_SHARE instead.
+  const modelBudget = (target: number) => Math.max(3000, target - (!isSubagent && brief ? textTokens(brief) : 0) - textTokens(tail()));
+  const system = prompt(modelBudget(budget), isSubagent);
   const window = model.contextWindow || input.contextWindow;
   const fits = (text: string) => !window || Math.ceil(textTokens(system + text) * 1.2) + OUTPUT_CAP + 4096 <= window;
   // Narrow the input before giving the whole compaction back to pi's native summary.
@@ -223,18 +233,19 @@ export async function summarize(input: SummaryInput) {
     if (!fits(sourceText)) fallback("capacity");
   }
 
-  const archive = archivePath(input.sessionId);
-  // Reserve the successful archive pointer before validation; do not write until the whole attempt passes.
-  let archived: ArchiveState = preparation.previousSummary || existsSync(archive) ? "archived" : "none";
-  const restoreList = prunedRestoreList(preparation, input.branchEntries);
-  const assemble = (text: string) => (brief ? insertBrief(text, brief) : text) +
-    (archived === "archived" ? `\n\nOlder details: ${archive} (read it only if needed).` : "") +
-    `\n\n${restoreBlock(archive, archived, !!restoreList)}${restoreList}`;
   let result = await call(input, system, sourceText);
   let summary = assemble(result.text);
   let condensed = false;
   if (textTokens(summary) > HARD_CAP) {
-    const target = Math.min(promptBudget, 6000);
+    restoreList = "";
+    summary = assemble(result.text);
+  }
+  if (textTokens(summary) > HARD_CAP) {
+    olderDetails = false;
+    summary = assemble(result.text);
+  }
+  if (textTokens(summary) > HARD_CAP) {
+    const target = modelBudget(Math.min(budget, 6000));
     result = await call(input, prompt(target, isSubagent), `<previous-summary>\n${result.text}\n</previous-summary>\n\nCondense this snapshot to fit the budget. Keep authorizations/prohibitions verbatim.`);
     summary = assemble(result.text);
     condensed = true;
@@ -251,7 +262,7 @@ export async function summarize(input: SummaryInput) {
       mkdirSync(path.dirname(archive), { recursive: true });
       appendFileSync(archive, `\n\n# Archived ${new Date().toISOString()}\n\n${preparation.previousSummary}\n`);
     } catch {
-      archived = "failed";
+      archived = existsSync(archive) ? "append-failed" : "failed";
       summary = assemble(result.text);
       if (textTokens(summary) > HARD_CAP) fallback("over-cap");
       compaction.summary = summary;
