@@ -15,7 +15,9 @@
   },
   "scripts": {
     "pretest": "node scripts/gen-tsconfig.mjs",
-    "test": "bun test"
+    "test": "bun test",
+    "eval:retention": "bun scripts/eval-retention.ts",
+    "eval:ab": "bun scripts/eval-retention.ts"
   },
   "pi": {
     "extensions": [

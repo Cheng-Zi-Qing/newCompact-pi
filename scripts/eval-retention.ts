@@ -4,7 +4,9 @@
 // Read-only: reads session files and model metadata; never writes into ~/.pi except the cache file under --out.
 // usage: bun scripts/eval-retention.ts [session.jsonl ...] [--questions N] [--sessions N] [--out path]
 //        [--model provider/model[:thinking]] [--concurrency N] [--plan] [--selftest] [--resnapshot]
-import { mkdtempSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+//        [--baseline-code <git-ref>] [--snapshot-code <git-ref>]
+import { mkdtempSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,13 +20,17 @@ import { BUDGET } from "../src/guard.ts";
 const CONDS = ["raw", "snap", "snap+restore"] as const;
 // Round 2 only: the same snapshot regenerated with the current summarize(), plus its own restore list recovered.
 const NEW_CONDS = ["snap:new", "snap:new+restore"] as const;
+// Code A/B: the snapshot written by another tree's src/summary.ts (baseline ref vs snapshot ref).
+const CODE_CONDS = ["snap:base", "snap:head"] as const;
+export type CodeCond = typeof CODE_CONDS[number];
 export type Cond = typeof CONDS[number] | typeof NEW_CONDS[number];
 const PRUNED_MARK = "[tool_result pruned; raw entry ";
 const RESTORE_HEAD_LIMIT = 8192; // one read_tool_result call returns at most this many codepoints
 const RAW_TOKEN_CAP = 200_000;
 
 // ---------- args ----------
-type Args = { files: string[]; questions: number; sessions: number; out: string; model?: string; concurrency: number; plan: boolean; selftest: boolean; resnapshot: boolean };
+type Args = { files: string[]; questions: number; sessions: number; out: string; model?: string; concurrency: number; plan: boolean;
+  selftest: boolean; resnapshot: boolean; baselineCode?: string; snapshotCode?: string };
 export function parseArgs(argv: string[]): Args {
   const args: Args = { files: [], questions: 6, sessions: 5, concurrency: 2, plan: false, selftest: false, resnapshot: false,
     out: path.join(homedir(), ".pi/agent/.eval-retention/cache.json") };
@@ -40,10 +46,44 @@ export function parseArgs(argv: string[]): Args {
     else if (a === "--plan") args.plan = true;
     else if (a === "--selftest") args.selftest = true;
     else if (a === "--resnapshot") args.resnapshot = true;
+    else if (a === "--baseline-code") args.baselineCode = value();
+    else if (a === "--snapshot-code") args.snapshotCode = value();
     else if (a.startsWith("--")) throw new Error(`Unknown flag ${a}`);
     else args.files.push(a);
   }
   return args;
+}
+
+// ---------- code A/B: temp git worktrees ----------
+const repoRoot = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+
+/** Which snapshot side a run has: baseline code ref, and the snapshot ref (absent = the working tree). */
+export function codeSides(args: { baselineCode?: string; snapshotCode?: string }): Array<{ cond: CodeCond; ref?: string }> {
+  const sides: Array<{ cond: CodeCond; ref?: string }> = [];
+  if (args.baselineCode) sides.push({ cond: "snap:base", ref: args.baselineCode });
+  if (args.snapshotCode || args.baselineCode) sides.push({ cond: "snap:head", ref: args.snapshotCode });
+  return sides;
+}
+
+/** Both refs go into the cache key: snapshots and answers from different code never mix. */
+export function abKey(sessionKey: string, baseRef?: string, headRef?: string): string {
+  return `${sessionKey}@base:${baseRef ?? "-"}@head:${headRef ?? "worktree"}`;
+}
+
+/** Temp git worktree at ref; the caller removes it (in a finally block). */
+export function addWorktree(ref: string): string {
+  const dir = mkdtempSync(path.join(tmpdir(), "pi-eval-code-"));
+  try { execFileSync("git", ["worktree", "add", "--detach", dir, ref], { cwd: repoRoot, stdio: "pipe" });
+  } catch (error: any) {
+    rmSync(dir, { recursive: true, force: true });
+    throw new Error(`git worktree add ${ref} failed: ${String(error?.stderr ?? error?.message ?? error).trim()}`);
+  }
+  return dir;
+}
+
+export function removeWorktree(dir: string) {
+  try { execFileSync("git", ["worktree", "remove", "--force", dir], { cwd: repoRoot, stdio: "pipe" }); }
+  catch { rmSync(dir, { recursive: true, force: true }); try { execFileSync("git", ["worktree", "prune"], { cwd: repoRoot, stdio: "pipe" }); } catch { /* best effort */ } }
 }
 
 // ---------- reading sessions (read-only) ----------
@@ -341,7 +381,10 @@ type SessionRecord = { file: string; sessionId: string; cwd: string; compactionI
   discardedTokens: number; snapshotTokens: number; recoverable: number; prunedListed: number; archived: boolean;
   model: string /* probe+judge spec, not the snapshot author */; snapshotModel?: string; truncated: boolean; probeUsage?: Usage; pairs?: PairRecord[];
   newSummary?: string; newSnapshotTokens?: number; newListed?: number; newUsage?: Usage }; // --resnapshot only
-type Cache = { version: 1; model: string; sessions: Record<string, SessionRecord>; lastRun?: any };
+type AbSnapshot = { ref: string; model: string; summary: string; tokens: number; listed: number; usage: Usage };
+// One entry per (session, code refs): snapshots and answers belong to one pair of trees.
+type AbEntry = { snapshots: Partial<Record<CodeCond, AbSnapshot>>; answers: Record<string, AnswerRecord> };
+type Cache = { version: 1; model: string; sessions: Record<string, SessionRecord>; ab?: Record<string, AbEntry>; lastRun?: any };
 
 function loadCache(file: string): Cache {
   try {
@@ -475,6 +518,24 @@ async function main() {
   // Regeneration writes an archive when there is a previous summary: keep it out of ~/.pi/agent.
   if (args.resnapshot) process.env.PI_COMPACT_DIR = mkdtempSync(path.join(tmpdir(), "pi-compact-eval-"));
   const snapUsage = { cost: 0, input: 0, output: 0, ms: 0 };
+  /** One summarize() call from `mod` (a tree's src/summary.ts), driven through the probe's shared pacing/retry. */
+  const runSummarize = async (mod: any, c: Candidate, spec: string) => {
+    const { model } = resolve(spec);
+    const complete = async (m: any, ctx: any, options: any) => {
+      const body = (ctx?.messages ?? []).map((x: any) => Array.isArray(x.content)
+        ? x.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n") : String(x.content ?? "")).join("\n");
+      await pace(Math.min(RATE_TOKENS, textTokens(String(ctx?.systemPrompt ?? "")) + textTokens(body) + (options?.maxTokens ?? 0)));
+      return withRetry(() => registry.streamSimple(m, ctx, options).result());
+    };
+    const { branchEntries, preparation } = preparationFor(c);
+    const out = await mod.summarize({ preparation, branchEntries, signal: new AbortController().signal, model, complete,
+      sessionId: c.sessionId, sessionFile: c.file, isSubagent: false, budget: BUDGET, contextWindow: model.contextWindow });
+    const spent = out.compaction.usage ?? {};
+    return { messages: preparation.messagesToSummarize.length, summary: out.compaction.summary as string,
+      tokens: out.tokens as number, listed: restoreRefsOf(out.compaction.summary, branchEntries).length,
+      usage: { input: spent.input ?? 0, output: spent.output ?? 0, cached: spent.cacheRead ?? 0,
+        cost: spent.cost?.total ?? 0, ms: 0 } };
+  };
   for (const session of sessions) {
     if (!args.resnapshot) break;
     const record = cache.sessions[session.key];
@@ -483,32 +544,19 @@ async function main() {
     // The regenerated snapshot must be written by the session's own model, never by the probe/judge spec.
     const spec = session.c.model;
     if (!spec) { skipped.push(`${session.c.sessionId.slice(0, 8)}: no session model for the regenerated snapshot`); continue; }
-    const { model } = resolve(spec);
-    // summarize() drives its own model call: same pacing and retry as the probe calls.
-    const complete = async (m: any, ctx: any, options: any) => {
-      const body = (ctx?.messages ?? []).map((x: any) => Array.isArray(x.content)
-        ? x.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n") : String(x.content ?? "")).join("\n");
-      await pace(Math.min(RATE_TOKENS, textTokens(String(ctx?.systemPrompt ?? "")) + textTokens(body) + (options?.maxTokens ?? 0)));
-      return withRetry(() => registry.streamSimple(m, ctx, options).result());
-    };
-    const { branchEntries, preparation } = preparationFor(session.c);
-    process.stderr.write(`resnapshot: ${session.c.sessionId.slice(0, 8)} with ${spec} (${preparation.messagesToSummarize.length} messages)... `);
+    process.stderr.write(`resnapshot: ${session.c.sessionId.slice(0, 8)} with ${spec}... `);
     try {
-      const out = await summarize({ preparation, branchEntries, signal: new AbortController().signal, model, complete,
-        sessionId: session.c.sessionId, sessionFile: session.c.file, isSubagent: false, budget: BUDGET,
-        contextWindow: model.contextWindow });
-      const spent = out.compaction.usage ?? {};
+      const out = await runSummarize({ summarize }, session.c, spec);
+      process.stderr.write(`ok (${out.messages} messages, ${record.snapshotTokens} -> ${out.tokens} tokens, ${out.listed} restorable)\n`);
       if (record.newSummary) for (const pair of record.pairs ?? [])
         for (const cond of NEW_CONDS) delete pair.conditions?.[cond]; // stale answers for the replaced snapshot
       record.snapshotModel = spec;
-      record.newSummary = out.compaction.summary;
+      record.newSummary = out.summary;
       record.newSnapshotTokens = out.tokens;
-      record.newListed = restoreRefsOf(out.compaction.summary, branchEntries).length;
-      record.newUsage = { input: spent.input ?? 0, output: spent.output ?? 0, cached: spent.cacheRead ?? 0,
-        cost: spent.cost?.total ?? 0, ms: 0 };
-      snapUsage.input += record.newUsage.input; snapUsage.output += record.newUsage.output; snapUsage.cost += record.newUsage.cost;
+      record.newListed = out.listed;
+      record.newUsage = out.usage;
+      snapUsage.input += out.usage.input; snapUsage.output += out.usage.output; snapUsage.cost += out.usage.cost;
       saveCache(args.out, cache);
-      process.stderr.write(`ok (${record.snapshotTokens} -> ${out.tokens} tokens, ${record.newListed} restorable)\n`);
     } catch (error) {
       const why = error instanceof Error ? error.message : String(error);
       process.stderr.write(`failed: ${why}\n`);
@@ -516,7 +564,75 @@ async function main() {
     }
   }
 
+  // ---------- code A/B: the same questions answered from snapshots written by two different trees ----------
+  const sides = codeSides(args);
+  const abAnswers = { cost: 0, n: 0 };
+  if (sides.length) {
+    // summarize() can write an archive: keep that, and every worktree's build output, out of ~/.pi/agent.
+    process.env.PI_COMPACT_DIR ??= mkdtempSync(path.join(tmpdir(), "pi-compact-eval-"));
+    cache.ab ??= {};
+    const trees: string[] = [];
+    try {
+      // Load one module per ref: the working tree (no ref) or a detached worktree of that ref.
+      const modules = new Map<string, any>();
+      for (const side of sides) {
+        const id = side.ref ?? "worktree";
+        if (modules.has(id)) continue;
+        const dir = side.ref ? addWorktree(side.ref) : undefined;
+        if (dir) trees.push(dir);
+        process.stderr.write(`code ${side.cond}: ${side.ref ?? "working tree"}${dir ? ` (worktree ${dir})` : ""}... `);
+        try {
+          modules.set(id, dir ? await import(`${dir}/src/summary.ts`) : { summarize });
+          process.stderr.write("loaded\n");
+        } catch (error) {
+          if (dir) { removeWorktree(dir); trees.splice(trees.indexOf(dir), 1); }
+          throw error;
+        }
+      }
+      for (const session of sessions) {
+        const entry = (cache.ab[abKey(session.key, args.baselineCode, args.snapshotCode)] ??= { snapshots: {}, answers: {} });
+        // One model for both sides, as in the reference A/B: --model when given, else the session's own author.
+        const spec = args.model ?? session.c.model ?? session.spec;
+        for (const side of sides) {
+          const cached = entry.snapshots[side.cond];
+          if (cached && cached.model === spec) continue; // one snapshot text per side and model
+          process.stderr.write(`code snapshot ${session.c.sessionId.slice(0, 8)} ${side.cond} with ${spec}... `);
+          try {
+            const out = await runSummarize(modules.get(side.ref ?? "worktree"), session.c, spec);
+            // Answers belong to one snapshot text: drop them when the snapshot is replaced.
+            if (cached) for (const index of session.pairs.keys()) delete entry.answers[`${index}|${side.cond}`];
+            entry.snapshots[side.cond] = { ref: side.ref ?? "worktree", model: spec, summary: out.summary,
+              tokens: out.tokens, listed: out.listed, usage: out.usage };
+            saveCache(args.out, cache);
+            process.stderr.write(`ok (${out.tokens} tokens, ${out.listed} restorable)\n`);
+          } catch (error) {
+            const why = error instanceof Error ? error.message : String(error);
+            process.stderr.write(`failed: ${why}\n`);
+            skipped.push(`${session.c.sessionId.slice(0, 8)}: ${side.cond} snapshot failed (${why.slice(0, 80)})`);
+          }
+        }
+      }
+    } finally {
+      // The imported modules keep their worktree paths in memory only; nothing is imported after this point.
+      for (const dir of trees) removeWorktree(dir);
+    }
+  }
+
   // Answer + judge: one independent call per (pair, condition); the condition is never named to the judge.
+  const grade = async (call: Caller, pair: PairRecord, context: string): Promise<AnswerRecord> => {
+    const answered = await call(ANSWER_SYSTEM, `Context:\n<<<\n${context}\n>>>\n\nQuestion: ${pair.question}`, 1500);
+    const judged = await call(JUDGE_SYSTEM, `Question: ${pair.question}\nReference answer: ${pair.answer}\nCandidate answer: ${answered.text}`, 800);
+    let verdict = "incorrect", reason = "";
+    try {
+      const parsed = parseJsonObject(judged.text);
+      verdict = ["correct", "partial", "incorrect"].includes(parsed?.verdict) ? parsed.verdict : "incorrect";
+      reason = typeof parsed?.reason === "string" ? parsed.reason.slice(0, 200) : "";
+    } catch { reason = "unparseable judge output"; }
+    return { answer: answered.text, verdict, reason, exact: exactHit(pair.answer, answered.text),
+      usage: { ...answered.usage, ms: answered.usage.ms + judged.usage.ms, cost: answered.usage.cost + judged.usage.cost,
+        input: answered.usage.input + judged.usage.input, output: answered.usage.output + judged.usage.output,
+        cached: answered.usage.cached + judged.usage.cached }, at: new Date().toISOString() };
+  };
   const jobs: Array<() => Promise<void>> = [];
   for (const session of sessions) {
     const ctx = contexts(session.c, cache.sessions[session.key].newSummary);
@@ -527,19 +643,25 @@ async function main() {
       for (const cond of order) {
         if (pair.conditions[cond]?.verdict) continue;
         jobs.push(async () => {
-          const spec = session.spec, call = caller(spec);
-          const answered = await call(ANSWER_SYSTEM, `Context:\n<<<\n${ctx[cond]}\n>>>\n\nQuestion: ${pair.question}`, 1500);
-          const judged = await call(JUDGE_SYSTEM, `Question: ${pair.question}\nReference answer: ${pair.answer}\nCandidate answer: ${answered.text}`, 800);
-          let verdict = "incorrect", reason = "";
-          try {
-            const parsed = parseJsonObject(judged.text);
-            verdict = ["correct", "partial", "incorrect"].includes(parsed?.verdict) ? parsed.verdict : "incorrect";
-            reason = typeof parsed?.reason === "string" ? parsed.reason.slice(0, 200) : "";
-          } catch { reason = "unparseable judge output"; }
-          pair.conditions![cond] = { answer: answered.text, verdict, reason, exact: exactHit(pair.answer, answered.text),
-            usage: { ...answered.usage, ms: answered.usage.ms + judged.usage.ms, cost: answered.usage.cost + judged.usage.cost,
-              input: answered.usage.input + judged.usage.input, output: answered.usage.output + judged.usage.output,
-              cached: answered.usage.cached + judged.usage.cached }, at: new Date().toISOString() };
+          pair.conditions![cond] = await grade(caller(session.spec), pair, ctx[cond]!);
+          saveCache(args.out, cache);
+        });
+      }
+    }
+  }
+  // Code A/B answers: the same cached questions against one snapshot per side.
+  if (sides.length) for (const session of sessions) {
+    const entry = cache.ab?.[abKey(session.key, args.baselineCode, args.snapshotCode)];
+    if (!entry) continue;
+    for (const [index, pair] of session.pairs.entries()) {
+      const order = sides.filter(s => entry.snapshots[s.cond])
+        .sort((a, b) => hash(`${pair.question}${a.cond}`) - hash(`${pair.question}${b.cond}`));
+      for (const side of order) {
+        const key = `${index}|${side.cond}`;
+        if (entry.answers[key]?.verdict) continue;
+        jobs.push(async () => {
+          entry.answers[key] = await grade(caller(session.spec), pair, entry.snapshots[side.cond]!.summary);
+          abAnswers.n++;
           saveCache(args.out, cache);
         });
       }
@@ -614,6 +736,42 @@ async function main() {
     `${sessions.filter(s => cache.sessions[s.key].newSnapshotTokens).length}/${sessions.length} regenerated, ` +
     `new snapshots total ${sessions.reduce((n, s) => n + (cache.sessions[s.key].newSnapshotTokens ?? 0), 0)} tokens, ` +
     `restorable now ${sessions.reduce((n, s) => n + (cache.sessions[s.key].newListed ?? 0), 0)} (of ${sessions.reduce((n, s) => n + s.c.pruned.length, 0)} in range)`);
+  if (sides.length) {
+    // One shared model per side pair, so a difference is the tree's, not the author's.
+    const abLabel = (side: { cond: CodeCond; ref?: string }) => `${side.cond} (${side.ref ?? "worktree"})`;
+    const acc = Object.fromEntries(sides.map(s => [s.cond, { n: 0, correct: 0, partial: 0, cost: 0 }])) as any;
+    const cats: Record<string, any> = {};
+    const abRows: string[][] = [["session", "n", ...sides.map(abLabel), "restorable base -> head", "snapshot tok base -> head"]];
+    for (const session of sessions) {
+      const entry = cache.ab?.[abKey(session.key, args.baselineCode, args.snapshotCode)];
+      const per = Object.fromEntries(sides.map(s => [s.cond, { n: 0, correct: 0, partial: 0 }])) as any;
+      for (const [index, pair] of session.pairs.entries()) for (const side of sides) {
+        const rec = entry?.answers[`${index}|${side.cond}`];
+        if (!rec?.verdict) continue;
+        abAnswers.cost += rec.usage.cost;
+        for (const b of [per[side.cond], acc[side.cond]]) { b.n++; if (rec.verdict === "correct") b.correct++; if (rec.verdict !== "incorrect") b.partial++; }
+        acc[side.cond].cost += rec.usage.cost;
+        const cat = ((cats[pair.category] ??= Object.fromEntries(sides.map(s => [s.cond, { n: 0, correct: 0 }]))));
+        cat[side.cond].n++; if (rec.verdict === "correct") cat[side.cond].correct++;
+      }
+      const tokens = (c: CodeCond) => entry?.snapshots[c]?.tokens;
+      const base = entry?.snapshots["snap:base"];
+      abRows.push([session.c.sessionId.slice(0, 8), String(per[sides[0].cond].n),
+        ...sides.map(s => `${pct(per[s.cond].correct, per[s.cond].n)} (${pct(per[s.cond].partial, per[s.cond].n)})`),
+        `${base?.listed ?? "-"} -> ${entry?.snapshots["snap:head"]?.listed ?? "-"}`,
+        `${tokens("snap:base") ?? "-"} -> ${tokens("snap:head") ?? "-"}`]);
+    }
+    const n = acc[sides[0].cond].n;
+    abRows.push(["overall", String(n), ...sides.map(s => `${pct(acc[s.cond].correct, acc[s.cond].n)} (${pct(acc[s.cond].partial, acc[s.cond].n)})`), "", ""]);
+    console.log("\ncode A/B (same cached questions, one snapshot per side, one model per session):");
+    console.log(table(abRows));
+    console.log("\ncode A/B by keyword category (correct / n):");
+    console.log(table([["category", ...sides.map(abLabel)], ...CATEGORIES.filter(c => cats[c]).map(c =>
+      [c, ...sides.map(s => `${cats[c][s.cond].correct}/${cats[c][s.cond].n}`)])]));
+    const snapCost = sides.reduce((sum, s) => sum + sessions.reduce((n2, x) =>
+      n2 + (cache.ab?.[abKey(x.key, args.baselineCode, args.snapshotCode)]?.snapshots[s.cond]?.usage.cost ?? 0), 0), 0);
+    console.log(`code A/B spend: snapshots $${snapCost.toFixed(4)}, answers+judges $${abAnswers.cost.toFixed(4)} (${abAnswers.n} pairs)`);
+  }
   if (skipped.length) console.log(`skipped: ${skipped.join("; ")}`);
   console.log(`cache: ${args.out}`);
 
@@ -665,6 +823,16 @@ function selftest() {
   const parsedArgs = parseArgs(["--questions", "3", "a.jsonl", "--sessions", "2"]);
   assert(parsedArgs.questions === 3 && parsedArgs.sessions === 2 && parsedArgs.files[0] === "a.jsonl", "arg parsing");
   assert(!parsedArgs.resnapshot && parseArgs(["--resnapshot"]).resnapshot === true, "resnapshot is opt-in");
+  const abArgs = parseArgs(["--baseline-code", "e178a65", "--snapshot-code", "HEAD"]);
+  assert(abArgs.baselineCode === "e178a65" && abArgs.snapshotCode === "HEAD", "code A/B flags parse");
+  assert(codeSides({}).length === 0, "no code A/B without a ref");
+  const headOnly = codeSides({ baselineCode: "e178a65" });
+  assert(headOnly.length === 2 && headOnly[1].cond === "snap:head" && headOnly[1].ref === undefined,
+    "head defaults to the working tree when only the baseline ref is given");
+  assert(codeSides({ snapshotCode: "12a74da" }).length === 1, "a snapshot ref alone gives one side");
+  assert(abKey("s@c@m", "e178a65", "12a74da") !== abKey("s@c@m", "e178a65", undefined) &&
+    abKey("s@c@m", "a", "b").includes("base:a") && abKey("s@c@m", "a", "b").includes("head:b"),
+    "cache keys carry both code refs");
   assert(/\/\.eval-retention\/cache\.json$/.test(parseArgs([]).out), "default cache lives outside the repo");
   console.log("selftest ok");
 }

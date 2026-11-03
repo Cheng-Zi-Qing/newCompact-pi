@@ -183,6 +183,23 @@ node scripts/report.mjs ~/.pi/agent/sessions/<目录>/<会话>.jsonl
 
 输出每次压缩的时间、来源（插件 / 原生）、压缩前 token 数、摘要大小、压缩后首轮请求用量、与上次的间隔，以及输出被截断的次数。
 
+## 效果评估
+
+压缩到底有没有用，可以用仓库里的留存探针自己测（脚本 `scripts/eval-retention.ts`，只读会话文件，唯一写入是 `<agentDir>/.eval-retention/` 下的结果缓存）。三条命令，从便宜到贵：
+
+```bash
+# 1) 只看会测什么：选哪些会话、压缩比、能恢复多少条目——不调模型，零成本
+npm run eval:retention -- --plan --sessions 4
+
+# 2) 绝对留存：同一个压缩点，被压掉的原文（RAW）vs 快照（SNAP）vs 快照+读回原文（SNAP+RESTORE）
+npm run eval:retention -- --questions 6 --sessions 4 --model <provider/model>
+
+# 3) 代码 A/B：同一个模型、同一套题，换 src/summary.ts 的版本，看改动是否真的提高了留存
+npm run eval:ab -- --baseline-code <ref> --questions 6 --sessions 4 --model <provider/model>
+```
+
+**结果只在同一个模型、同一套题内可比**：换模型等于换了快照作者和判分者，百分比不能直接相减。缓存按会话 + 压缩点 + 模型（A/B 还带两个代码 ref）分键，重跑只补缺的部分，已答过的题不再计费。已知实测与方法见 `docs/retention-eval.md`。
+
 ## 测试
 
 ```bash
