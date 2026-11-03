@@ -256,6 +256,7 @@ export type SummaryInput = {
   preparation: any; branchEntries: any[]; customInstructions?: string; signal: AbortSignal;
   model: any; complete: Complete; sessionId: string; sessionFile?: string; isSubagent: boolean; budget: number;
   contextWindow?: number; // fallback when the model reports none (e.g. virtual models)
+  thinking?: string; // `:thinking` suffix of piCompact.summaryModel; overrides the default low reasoning
   validate?: (compaction: any) => void; // boundary projection check, before any archive write
 };
 
@@ -263,7 +264,8 @@ async function call(input: SummaryInput, system: string, text: string) {
   const { model, signal } = input;
   // Provider-neutral options for modelRegistry.streamSimple (handles every API and virtual models).
   const options: any = { maxTokens: OUTPUT_CAP, cacheRetention: "none", signal };
-  if (model.reasoning || model.api === "pi-virtual") options.reasoning = "low";
+  if (input.thinking) options.reasoning = input.thinking;
+  else if (model.reasoning || model.api === "pi-virtual") options.reasoning = "low";
   const res = await input.complete(model, { systemPrompt: system, messages: [{ role: "user", content: [{ type: "text", text }], timestamp: Date.now() }] }, options);
   if (signal.aborted) fallback("aborted");
   if (res?.stopReason !== "stop") fallback(`stop:${res?.stopReason}`);

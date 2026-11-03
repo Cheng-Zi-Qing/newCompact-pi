@@ -255,3 +255,84 @@ describe("compact entry wiring", () => {
     expect(isSubagent(ctx)).toBe(true);
   });
 });
+
+describe("piCompact.summaryModel", () => {
+  const section = (fill: string) => SECTIONS.map(s => `## ${s}\n${fill}`).join("\n\n");
+  const snapshot = section("ok"), oversized = section("word ".repeat(8000));
+  const event = (messages: any[] = [{ role: "user", content: "hi", timestamp: 1 }]) => ({ reason: "threshold", signal: new AbortController().signal, branchEntries: [],
+    preparation: { messagesToSummarize: messages, turnPrefixMessages: [], firstKeptEntryId: "aaaaaaaa", tokensBefore: 1, fileOps: {} } });
+  const strong = { id: "strong", provider: "p2", api: "openai-responses", reasoning: false, contextWindow: 200_000, maxTokens: 16384 };
+  function setup(replies: any[], settings: any, models: any[] = [strong]) {
+    resetStates();
+    const pi = fakePi(["read_tool_result"], settings); compact(pi);
+    const { ctx } = session([]);
+    const calls: any[] = [];
+    ctx.modelRegistry = {
+      find: (p: string, id: string) => models.find(m => m.provider === p && m.id === id),
+      streamSimple: (m: any, _c: any, o: any) => ({ result: async () => { calls.push({ model: m, opts: o }); return replies.shift(); } }),
+    };
+    return { pi, ctx, calls };
+  }
+  const warnings = (ctx: any) => ctx.ui.notify.mock.calls.filter((c: any[]) => c[1] === "warning");
+
+  test("unset: the session model writes snapshots, low reasoning as before", async () => {
+    const { pi, ctx, calls } = setup([{ stopReason: "stop", content: [{ type: "text", text: snapshot }] }], {});
+    await pi.handlers.session_before_compact(event(), ctx);
+    expect(calls.length).toBe(1);
+    expect(calls[0].model).toBe(ctx.model);
+    expect(calls[0].opts.reasoning).toBe("low");
+    expect(warnings(ctx).length).toBe(0);
+  });
+  test("set and resolvable: that model writes both the first and the condensed snapshot", async () => {
+    const { pi, ctx, calls } = setup([{ stopReason: "stop", content: [{ type: "text", text: oversized }] },
+      { stopReason: "stop", content: [{ type: "text", text: snapshot }] }], { piCompact: { summaryModel: "p2/strong" } });
+    const out = await pi.handlers.session_before_compact(event(), ctx);
+    expect(out.compaction.summary).toContain("## Next Steps");
+    expect(calls.length).toBe(2);
+    expect(calls.map(c => c.model)).toEqual([strong, strong]);
+    expect(warnings(ctx).length).toBe(0);
+  });
+  test("unresolvable: falls back to the session model, warns once, still compacts", async () => {
+    const { pi, ctx, calls } = setup([{ stopReason: "stop", content: [{ type: "text", text: snapshot }] },
+      { stopReason: "stop", content: [{ type: "text", text: snapshot }] }], { piCompact: { summaryModel: "nope/missing" } });
+    expect((await pi.handlers.session_before_compact(event(), ctx)).compaction.summary).toContain("## Goal");
+    expect((await pi.handlers.session_before_compact(event(), ctx)).compaction.summary).toContain("## Goal");
+    expect(calls.map(c => c.model)).toEqual([ctx.model, ctx.model]);
+    expect(warnings(ctx).length).toBe(1);
+    expect(warnings(ctx)[0][0]).toContain("not resolvable");
+    expect(readFileSync(path.join(process.env.PI_COMPACT_DIR!, "pi-compact.log"), "utf8")).toContain("summary-model=fallback:unresolvable");
+  });
+  test("malformed spec: fallback with its own warning", async () => {
+    const { pi, ctx, calls } = setup([{ stopReason: "stop", content: [{ type: "text", text: snapshot }] }], { piCompact: { summaryModel: "p2/strong:highish" } });
+    await pi.handlers.session_before_compact(event(), ctx);
+    expect(calls[0].model).toBe(ctx.model);
+    expect(warnings(ctx).length).toBe(1);
+    expect(warnings(ctx)[0][0]).toContain("Invalid piCompact.summaryModel");
+  });
+  test(":thinking overrides the reasoning option for both calls only", async () => {
+    const { pi, ctx, calls } = setup([{ stopReason: "stop", content: [{ type: "text", text: oversized }] },
+      { stopReason: "stop", content: [{ type: "text", text: snapshot }] }], { piCompact: { summaryModel: "p2/strong:high" } });
+    await pi.handlers.session_before_compact(event(), ctx);
+    expect(calls.length).toBe(2);
+    expect(calls.map(c => c.model)).toEqual([strong, strong]);
+    expect(calls.map(c => c.opts.reasoning)).toEqual(["high", "high"]);
+    // The session model keeps its default: the suffix never leaks into other calls.
+    expect(strong.reasoning).toBe(false);
+  });
+  test("capacity uses the summary model's window", async () => {
+    const flood = event([{ role: "user", content: "x".repeat(40_000), timestamp: 1 }]);
+    const { pi, ctx, calls } = setup([{ stopReason: "stop", content: [{ type: "text", text: snapshot }] }],
+      { piCompact: { summaryModel: "p2/strong" } }, [{ ...strong, contextWindow: 16_000 }]);
+    expect(await pi.handlers.session_before_compact(flood, ctx)).toBeUndefined(); // native summary takes over
+    expect(calls.length).toBe(0);
+    // Same input with the session model's 128k window fits, so the summary model's window was the binding one.
+    const again = setup([{ stopReason: "stop", content: [{ type: "text", text: snapshot }] }], {});
+    expect((await again.pi.handlers.session_before_compact(event([{ role: "user", content: "x".repeat(40_000), timestamp: 1 }]), again.ctx)).compaction).toBeDefined();
+  });
+  test("/context reports which model writes snapshots", async () => {
+    const { pi, ctx } = setup([], { piCompact: { summaryModel: "p2/strong:high" } });
+    await pi.commands.context.handler("", ctx);
+    const text = ctx.ui.notify.mock.calls.at(-1)[0];
+    expect(text).toContain("snapshot model=p2/strong:high (explicit) window=200,000");
+  });
+});

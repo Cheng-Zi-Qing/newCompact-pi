@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { BUDGET, busy, committed, decide, failed, FAIL_LIMIT, resetStates, stateOf, TIGHT_BUDGET } from "../src/guard.ts";
-import { effectiveContextTokens, freshUsageTotal, getTriggerRatio, THROTTLE_MS, usageDecision, compactionLine } from "../src/usage.ts";
+import { effectiveContextTokens, freshUsageTotal, getSummaryModel, getTriggerRatio, THROTTLE_MS, usageDecision, compactionLine } from "../src/usage.ts";
 
 beforeEach(resetStates);
 const T = 1_000_000;
@@ -123,6 +123,20 @@ describe("usage fallback", () => {
       expect(getTriggerRatio({ piCompact: { triggerRatio: ratio } }, () => warnings++)).toBe(0.8);
       expect(warnings).toBe(1);
     }
+  });
+  test("summary model: strict provider/model[:thinking] shape, session model when unset or unusable", () => {
+    const session = { provider: "p", id: "m" }, strong = { provider: "p2", id: "strong" };
+    const find = (provider: string, id: string) => provider === "p2" && id === "strong" ? strong : undefined;
+    expect(getSummaryModel({}, find, session)).toEqual({ model: session, explicit: false, reason: "unset" });
+    expect(getSummaryModel({ piCompact: { summaryModel: "p2/strong" } }, find, session)).toEqual({ model: strong, explicit: true, thinking: undefined });
+    expect(getSummaryModel({ piCompact: { summaryModel: "p2/strong:xhigh" } }, find, session)).toEqual({ model: strong, explicit: true, thinking: "xhigh" });
+    // nested model ids keep their slash; only a trailing valid level is read as thinking
+    expect(getSummaryModel({ piCompact: { summaryModel: "p2/meta/strong:max" } }, () => strong, session)).toEqual({ model: strong, explicit: true, thinking: "max" });
+    for (const bad of [null, 0.8, "", "p2", "/strong", "p2/", "p2/strong:highish", "p2/strong:"]) {
+      expect(getSummaryModel({ piCompact: { summaryModel: bad } }, find, session)).toEqual({ model: session, explicit: false, reason: "malformed" });
+    }
+    expect(getSummaryModel({ piCompact: { summaryModel: "p2/other" } }, find, session)).toEqual({ model: session, explicit: false, reason: "unresolvable" });
+    expect(getSummaryModel({ piCompact: { summaryModel: "p2/strong" } }, undefined, session).reason).toBe("unresolvable");
   });
   test("window no larger than reserve has no usable data", () => {
     for (const [window, reserve] of [[16384, 16384], [128_000, 200_000]]) {

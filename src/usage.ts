@@ -16,6 +16,27 @@ export function getTriggerRatio(settings: any, warn?: () => void): number {
   if (typeof ratio === "number" && Number.isFinite(ratio) && ratio >= 0.5 && ratio <= 0.95) return ratio;
   warn?.(); return DEFAULT_TRIGGER_RATIO;
 }
+// Mirrors pi-ai's ThinkingLevel: the only accepted `:thinking` suffixes in a summaryModel spec.
+export const SUMMARY_THINKING_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type SummaryTarget = { model: any; thinking?: string; explicit: boolean; reason?: "unset" | "malformed" | "unresolvable" };
+/** Which model writes snapshots. Strict `provider/model` or `provider/model:thinking`; anything else falls back. */
+export function getSummaryModel(settings: any, find: ((provider: string, id: string) => any) | undefined, sessionModel: any): SummaryTarget {
+  const raw = settings?.piCompact?.summaryModel;
+  if (raw === undefined) return { model: sessionModel, explicit: false, reason: "unset" };
+  let spec: { provider: string; id: string; thinking?: string } | undefined;
+  if (typeof raw === "string") {
+    const slash = raw.indexOf("/"), colon = raw.lastIndexOf(":");
+    const thinking = colon > slash ? raw.slice(colon + 1) : undefined;
+    const id = colon > slash ? raw.slice(slash + 1, colon) : raw.slice(slash + 1);
+    // No silent surprises: a bad `:thinking` suffix is malformed, not silently dropped from the model id.
+    if (slash > 0 && id && (thinking === undefined || (SUMMARY_THINKING_LEVELS as readonly string[]).includes(thinking))) {
+      spec = { provider: raw.slice(0, slash), id, thinking };
+    }
+  }
+  if (!spec) return { model: sessionModel, explicit: false, reason: "malformed" };
+  const model = find?.(spec.provider, spec.id);
+  return model ? { model, explicit: true, thinking: spec.thinking } : { model: sessionModel, explicit: false, reason: "unresolvable" };
+}
 export function usageDecision(s: SessionState, total: number | undefined, window: number | undefined, reserve: number, enabled: boolean, now: number, ratio = DEFAULT_TRIGGER_RATIO) {
   if (!enabled) return "disabled";
   if (!total || !window || compactionLine(window, reserve, ratio) <= 0) return "no-data";

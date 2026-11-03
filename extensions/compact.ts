@@ -3,7 +3,7 @@ import path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { busy, committed, decide, dropState, failed, stateOf } from "../src/guard.ts";
 import { dataDir, Fallback, summarize } from "../src/summary.ts";
-import { compactionLine, contextDiagnostics, effectiveContextTokens, usageDecision, usageInputs } from "../src/usage.ts";
+import { compactionLine, contextDiagnostics, effectiveContextTokens, getSummaryModel, usageDecision, usageInputs } from "../src/usage.ts";
 import { prepareBoundaryCompaction } from "../src/boundary.ts";
 import { replay } from "./tool-result-pruner.ts";
 import { textTokens } from "../src/estimate.ts";
@@ -36,6 +36,24 @@ const WHY_TEXT = {
 } as const;
 
 export default function piCompact(pi: ExtensionAPI) {
+  // piCompact.summaryModel: a cheap main model must not write cheap snapshots (see docs/retention-eval.md §八).
+  function summaryTarget(ctx: any) {
+    const sessionId = ctx.sessionManager.getSessionId();
+    const s = stateOf(sessionId);
+    const registry = ctx.modelRegistry;
+    const target = getSummaryModel(pi.getSettings(), typeof registry?.find === "function" ? (p: string, id: string) => registry.find(p, id) : undefined, ctx.model);
+    if (target.reason && !s.summaryNoted) {
+      s.summaryNoted = true;
+      log({ session: sessionId, "summary-model": `fallback:${target.reason}` });
+      // An unset key is the documented default, so only a key we cannot use is worth a warning.
+      if (target.reason !== "unset") try {
+        ctx.ui.notify(target.reason === "malformed"
+          ? "Invalid piCompact.summaryModel: expected \"provider/model\" or \"provider/model:thinking\"; using the session model for snapshots."
+          : `piCompact.summaryModel \"${JSON.stringify(pi.getSettings()?.piCompact?.summaryModel)}\" is not resolvable in this session; using the session model for snapshots.`, "warning");
+      } catch { /* optional UI */ }
+    }
+    return target;
+  }
   function inputs(ctx: any, manager = ctx.sessionManager) {
     return usageInputs(pi, ctx, manager, () => {
       const s = stateOf(ctx.sessionManager.getSessionId());
@@ -77,6 +95,7 @@ export default function piCompact(pi: ExtensionAPI) {
       const branch = ctx.sessionManager.getBranch();
       const details = contextDiagnostics(branch);
       const { total, window, reserve, ratio } = inputs(ctx);
+      const target = summaryTarget(ctx);
       const number = (n: number) => Math.round(n).toLocaleString("en-US");
       const line = window ? compactionLine(window, reserve, ratio) : undefined;
       const fit = details.calibration;
@@ -84,6 +103,7 @@ export default function piCompact(pi: ExtensionAPI) {
         `anchor=${details.anchor ? number(details.anchor.tokens) : "none"} age=${details.age} turns | delta=${number(details.delta)} savings=${number(details.savings)}`,
         `cal cjk=${fit.cjk.toFixed(3)}${fit.cjkLearned ? "" : "(prior)"} other=${fit.other.toFixed(3)}${fit.otherLearned ? "" : "(prior)"} n=${fit.observations} (${details.applied ? "calibrated" : "fallback"})`,
         `effective(A+B)=${number(total)} / ${window ? number(window) : "unknown"} (${window ? (total / window * 100).toFixed(1) + "%" : "unknown"}) line=${line === undefined ? "unknown" : number(line)} distance=${line === undefined ? "unknown" : number(line - total)}`,
+        `snapshot model=${target.model?.provider ?? "unknown"}/${target.model?.id ?? "unknown"}${target.thinking ? `:${target.thinking}` : ""} (${target.explicit ? "explicit" : "session"}) window=${target.model?.contextWindow ? number(target.model.contextWindow) : "unknown"}`,
       ].join("\n"), "info");
     },
   });
@@ -93,9 +113,10 @@ export default function piCompact(pi: ExtensionAPI) {
     if (d.action !== "run") return { cancel: true };
     s.compacting = true;
     try {
+      const target = summaryTarget(ctx);
       const out = await summarize({
         preparation: event.preparation, branchEntries: event.branchEntries, customInstructions: event.customInstructions,
-        signal: event.signal, model: ctx.model, complete: (m, c, o) => ctx.modelRegistry.streamSimple(m, c, o).result(),
+        signal: event.signal, model: target.model, thinking: target.thinking, complete: (m, c, o) => ctx.modelRegistry.streamSimple(m, c, o).result(),
         contextWindow: ctx.getContextUsage()?.contextWindow,
         sessionId, sessionFile: ctx.sessionManager.getSessionFile(), isSubagent: sub, budget: d.budget,
       });
@@ -153,7 +174,8 @@ export default function piCompact(pi: ExtensionAPI) {
       attempted = true;
       s.compacting = true;
       let after = 0;
-      const out = await summarize({ preparation, branchEntries: preview.getBranch(), signal, model: ctx.model,
+      const target = summaryTarget(ctx);
+      const out = await summarize({ preparation, branchEntries: preview.getBranch(), signal, model: target.model, thinking: target.thinking,
         complete: (m, c, o) => ctx.modelRegistry.streamSimple(m, c, o).result(), contextWindow: window,
         sessionId: base.session, sessionFile: ctx.sessionManager.getSessionFile(), isSubagent: base.sub, budget: d.budget,
         validate: compaction => {

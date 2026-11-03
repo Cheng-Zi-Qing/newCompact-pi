@@ -84,6 +84,23 @@ pi remove git:github.com/Cheng-Zi-Qing/newCompact-pi
 - 会话已写入文件：保留开头，并附上会话文件路径和条目 ID；
 - 会话只在内存里：同样截断，并明确说明原文无可寻址位置。
 
+### 快照由哪个模型写（`piCompact.summaryModel`）
+
+默认沿用会话模型。实测快照质量主要取决于写快照的模型，序列化细节影响小得多：同一套代码，gpt-6.1/opus 写的快照留存 79%，换成 deepseek-flash 只有 60%（见 [docs/retention-eval.md](docs/retention-eval.md) §四、§八）。所以要给快照单独指定一个强模型：
+
+```json
+{
+  "piCompact": { "summaryModel": "my-provider/my-strong-model:low" }
+}
+```
+
+- 格式是 `provider/model` 或 `provider/model:thinking`，用 `ctx.modelRegistry.find(provider, id)` 解析；首次摘要和超 8k 的浓缩都用这个模型。
+- `:thinking` 可选（`minimal`/`low`/`medium`/`high`/`xhigh`/`max`），只覆盖这一次调用的思考级别；不写仍默认 `low`。
+- 容量判断改用该模型的窗口（窗口是这次调用真正的限制），`OUTPUT_CAP`、结构校验、8k 硬上限都不变。
+- 不写、写成别的形状、或在本会话里解析不到时，回退会话模型，并记一条 `summary-model=fallback:<unset|malformed|unresolvable>`，每个会话只记一次；写了却不可用的还会弹一次警告（不写是默认行为，不打扰）。
+- 成本：每次压缩多一次强模型调用，输入是被摘要的那段上下文。窗口比会话模型小的模型会更容易触发 `capacity` 回退（交回 Pi 自带摘要）。
+- `/context` 第 4 行显示当前写快照的模型（`explicit` 为配置值，`session` 为会话模型）及其窗口。
+
 ### guard（熔断）
 
 状态只放在内存里，每个会话单独计数。
@@ -114,7 +131,7 @@ pi remove git:github.com/Cheng-Zi-Qing/newCompact-pi
 
 Pi 1.4.0 本来就会在运行中的两轮请求之间压缩，但 context_edit/compaction 出现在最后一次 usage 之后时，它会放弃实报基线而采用纯字符估算；状态栏的 `getContextUsage()` 也一样。因此在 1M 会话里，Pi / 状态栏可能显示约 540k，而 provider 实际用量已约 1M。插件的判断不再依赖这个偏低的数字；默认 80% 线也给下一轮数万 tokens 的增长留余量。
 
-稳定导出位于 `src/usage.ts`：`compactionLine(window, reserve, ratio)`、`effectiveContextTokens(branch, projection?)`，以及配置解析函数 `getTriggerRatio(settings, warn?)`，可供其他插件复用。
+稳定导出位于 `src/usage.ts`：`compactionLine(window, reserve, ratio)`、`effectiveContextTokens(branch, projection?)`，配置解析函数 `getTriggerRatio(settings, warn?)` 与 `getSummaryModel(settings, find?, sessionModel)`，可供其他插件复用。
 
 ### 轮间边界压缩
 
@@ -166,6 +183,7 @@ Pi 1.4.0 本来就会在运行中的两轮请求之间压缩，但 context_edit/
 |---|---|
 | `ok` / `condensed` | 插件摘要成功 / 浓缩后成功 |
 | `fallback:<原因>` | 交回 Pi 自带摘要；原因为 capacity、structure、stop:length、over-cap、aborted 等 |
+| `summary-model=fallback:<unset|malformed|unresolvable>` | 单独一行：`summaryModel` 没有或用不了，本次压缩用会话模型（每个会话一次） |
 | `committed` | 压缩已写入会话；`fromExtension=false` 表示用的是 Pi 自带摘要；`reason=untracked:*` 表示不是插件发起的 |
 | `commit-failed` | 提交失败，附带是否被中止、当前连续失败次数（`failStreak`）和错误信息 |
 | `cancel:rapid-loop` / `cancel:commit-failures` / `cancel:paused` | 主会话进入暂停（快速重复 / 连续提交失败）/ 暂停期间被拦截 |

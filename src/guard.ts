@@ -11,6 +11,7 @@ export type Attempt = { reason: Reason; streak: number; at: number };
 export type SessionState = {
   streak: number; lastAutoSuccess: number | null; paused: boolean; failStreak: number;
   attempt?: Attempt; usagePending?: boolean; usageLastAttempt: number; ratioWarned?: boolean; compacting?: boolean;
+  summaryNoted?: boolean; // summaryModel fallback already logged (and warned, when a key was set but unusable)
 };
 export type Decision =
   | { action: "run"; reason: Reason; budget: number; streak: number }
