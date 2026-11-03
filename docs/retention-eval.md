@@ -18,10 +18,10 @@
 
 ## 二、机制：信息在哪一步丢（代码依据）
 
-1. **摘要输入先被裁**：`src/summary.ts:SUMMARY_PROFILE`（第 69 行）把工具结果裁成"头 300 + 尾 100 字"，`toolCall` 参数裁到 300/命令 500 字，assistant 正文裁到 4000 字（`cut`/`headTail`，第 81–92 行）。中段的路径、数字、id 摘要模型根本没看见，快照里不可能有。
-2. **快照有硬上限**：`HARD_CAP = 8000` token（第 7 行）。超限时按顺序退让——先扔掉可寻址恢复清单（第 240 行），再扔掉 `Older details:` 归档指针（第 244 行），最后才重新压缩摘要（第 247 行）。也就是说上下文越紧张，越是先丢"怎么找回原文"的线索。
+1. **摘要输入先被裁**：`src/summary.ts:SUMMARY_PROFILE`（第 69 行附近）把工具结果裁成"头 300 + 尾 100 字"，`toolCall` 参数裁到 300/命令 500 字，assistant 正文裁到 4000 字（`cut`/`headTail`）。**本测之后已改**：工具结果变成"头 + 尾 + 中段按信息密度挑选的行"（`toolResultSlice`/`denseLines`），中段预算 full 300 / tight 120 字。
+2. **快照有硬上限**：`HARD_CAP = 8000` token（第 8 行）。**本测之后已改**：退让顺序变成"溢出量不超过清单就先丢清单（不调模型）→ 否则先浓缩一次 → 仍超才丢 `Older details:` 指针 → 最后回退"，恢复清单有固定预留预算（`LIST_BUDGET = 200` token）。
 3. **压缩后只有快照 + kept 消息**：`src/boundary.ts:prepareBoundaryCompaction` 用 `findCutPoint` 定出 `firstKeptEntryId`（第 21–22 行），此前的一切从模型上下文消失，只剩摘要。
-4. **恢复清单只给地址不给内容**：`prunedRestoreList`（第 148 行）最多列 20 个 `entryId toolName originalChars`；取回要调 `read_tool_result`（`extensions/tool-result-pruner.ts` 第 39 行），单次上限 8192 codepoints（第 10 行 `KEEP_LIMIT`）。
+4. **恢复清单只给地址不给内容**：`prunedRestoreList`（第 195 行附近）**本测之后已改**：最多 8 条、每条 `entryId toolName originalChars: 关键片段`（≤120 字），整份清单 ≤200 token；取回仍要调 `read_tool_result`（`extensions/tool-result-pruner.ts` 第 39 行），单次上限 8192 codepoints（第 10 行 `KEEP_LIMIT`）。
 
 ## 三、怎么跑
 
@@ -92,6 +92,8 @@ bun scripts/eval-retention.ts --selftest
 代价与耗时：72 次作答+判分调用，607,475 输入 token / 8,093 输出 token，**$0.21**，调用耗时累计 146s、整轮墙钟 **308s**（缓存已满，重跑仅复述报表）。
 
 ## 五、从数据得到的三个最高价值修法
+
+> 三条均已按本节的形状实现（信息密度切片、清单固定预留预算 + 带关键片段、退让顺序改为先浓缩后丢清单）。§四的 79%/83% 是**改之前**的产物形态；重测请用 §七 的命令，换一个 `--out` 避免命中旧缓存。
 
 1. **让摘要输入保留"中间那段数字"**：全部 5 个失败里 3 个是数字/结果片段，而 `SUMMARY_PROFILE` 对工具结果只留头 300 + 尾 100。把 toolResult 改成"头 300 + 尾 100 + 命中数字/路径的片段"（或把 bash 输出改成头尾 + 每行首尾），比加大快照预算更省 token。
 2. **恢复清单要能被找到，而且先于摘要预算被牺牲**：现在是 `HARD_CAP` 一超就先扔掉恢复清单（第 240 行），而数据表明它是唯一能把 50%→67% 拉回来的东西。改成"清单永远占固定小额预算（例如 ≤800 token，只列最新 8 条），先压缩正文再压清单"。

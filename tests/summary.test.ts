@@ -9,7 +9,7 @@ process.env.PI_COMPACT_DIR = tmp;
 const prodLog = path.join(os.homedir(), ".pi/agent/pi-compact.log");
 const prodLogBefore = existsSync(prodLog) ? statSync(prodLog).mtimeMs : null;
 
-const { summarize, SECTIONS, Fallback, archivePath, dataDir, taskBrief, HARD_CAP, BRIEF_CAP, MAIN_BRIEF_CAP, serializeForSummary, SUMMARY_PROFILE, checkStructure, insertBrief, restoreBlock } = await import("../src/summary.ts");
+const { summarize, SECTIONS, Fallback, archivePath, dataDir, taskBrief, HARD_CAP, BRIEF_CAP, MAIN_BRIEF_CAP, LIST_BUDGET, serializeForSummary, SUMMARY_PROFILE, checkStructure, insertBrief, restoreBlock } = await import("../src/summary.ts");
 const { textTokens } = await import("../src/estimate.ts");
 
 const model = { id: "m", provider: "p", api: "openai-responses", reasoning: true, contextWindow: 128000, maxTokens: 16384 };
@@ -127,15 +127,28 @@ describe("summarize", () => {
     const i = input([reply(snapshot("word ".repeat(8000))), reply(snapshot())], { budget: 8000, branchEntries });
     const out = await summarize(i);
     const archive = archivePath(i.sessionId);
-    const fullTail = `\n\nOlder details: ${archive} (read it only if needed).\n\n${restoreBlock(archive, "archived")}`;
-    const degradedTail = `\n\n${restoreBlock(archive, "archived")}`;
+    const tail = `\n\nOlder details: ${archive} (read it only if needed).\n\n${restoreBlock(archive, "archived")}`;
     const briefTokens = textTokens(taskBrief(branchEntries, undefined, "main")!);
     expect(calls).toHaveLength(2);
-    expect(calls[0].ctx.systemPrompt).toContain(`Total budget: <= ${8000 - briefTokens - textTokens(fullTail)} tokens`);
-    expect(calls[1].ctx.systemPrompt).toContain(`Total budget: <= ${6000 - briefTokens - textTokens(degradedTail)} tokens`);
+    expect(calls[0].ctx.systemPrompt).toContain(`Total budget: <= ${8000 - briefTokens - textTokens(tail)} tokens`);
+    // The condense call still carries the archive pointer, so it is charged the same tail.
+    expect(calls[1].ctx.systemPrompt).toContain(`Total budget: <= ${6000 - briefTokens - textTokens(tail)} tokens`);
     expect(out.condensed).toBe(true);
-    expect(out.compaction.summary).not.toContain("Older details:");
+    expect(out.compaction.summary).toContain("Older details:");
     expect(out.compaction.summary).toContain(`older snapshots in ${archive}`);
+  });
+  test("mid-heavy session: the snapshot input alone carries the UUID and the error line", async () => {
+    const uuid = "3f9a1c2e-8b7d-4e5f-9a0b-1c2d3e4f5a6b";
+    const err = "Error: ENOENT: no such file or directory, open '/work/proj/src/gone.ts'";
+    const raw = `HEAD-${"h".repeat(500)}\n${"filler line without signals\n".repeat(1500)}RETRY ${uuid}\n${err}\n${"t".repeat(800)}-TAIL`;
+    const i = input([reply(snapshot())], { preparation: { messagesToSummarize: [user("go"),
+      { role: "toolResult", toolName: "bash", content: [{ type: "text", text: raw }] }], turnPrefixMessages: [],
+      firstKeptEntryId: "aaaaaaaa", tokensBefore: 90000 } });
+    const out = await summarize(i);
+    const sent = calls[0].ctx.messages[0].content[0].text;
+    expect(sent).toContain(uuid);
+    expect(sent).toContain(err);
+    expect(out.tokens).toBeLessThanOrEqual(HARD_CAP);
   });
   test("over 8k -> one condense call succeeds", async () => {
     const out = await summarize(input([reply(snapshot("word ".repeat(8000))), reply(snapshot())]));
@@ -223,6 +236,35 @@ describe("serializeForSummary", () => {
     expect(text.startsWith("[Tool result]: HEADmmm")).toBe(true);
     expect(text.endsWith("TAIL")).toBe(true);
     expect(text).toContain(`[+${body.length - SUMMARY_PROFILE.full.resultHead - SUMMARY_PROFILE.full.resultTail} chars]`);
+  });
+  test("a dense middle survives the cut: ids, paths and error lines reach the summarizer", () => {
+    const uuid = "3f9a1c2e-8b7d-4e5f-9a0b-1c2d3e4f5a6b";
+    const err = "Error: ENOENT: no such file or directory, open '/work/proj/src/gone.ts'";
+    const middle = `${"filler line without signals\n".repeat(1500)}RETRY ${uuid}\n${err}\nID 123456789: exit code 42\n`;
+    const body = `HEAD-${"h".repeat(500)}\n${middle}${"t".repeat(800)}-TAIL`;
+    expect(body.length).toBeGreaterThan(40000);
+    const msg = { role: "toolResult", toolName: "bash", content: [{ type: "text", text: body }] };
+    const full = serializeForSummary([msg]).slice("[Tool result]: ".length);
+    expect(full).toContain(uuid);
+    expect(full).toContain(err);
+    expect(full).toContain("exit code 42");
+    expect(full.startsWith("HEAD-h")).toBe(true);
+    expect(full.endsWith("-TAIL")).toBe(true);
+    expect(full).toMatch(/\[\+\d+ chars\]\n.* … .*\n\[\+\d+ chars\]/); // both omission markers survive
+    const budget = SUMMARY_PROFILE.full.resultHead + SUMMARY_PROFILE.full.resultTail + SUMMARY_PROFILE.full.resultMid;
+    expect(full.length).toBeLessThanOrEqual(budget + 60); // head + tail + mid + the two markers
+    // The tight fallback keeps the same signals in a proportionally smaller budget.
+    const tight = serializeForSummary([msg], "tight").slice("[Tool result]: ".length);
+    expect(tight).toContain(uuid);
+    const tightBudget = SUMMARY_PROFILE.tight.resultHead + SUMMARY_PROFILE.tight.resultTail + SUMMARY_PROFILE.tight.resultMid;
+    expect(tight.length).toBeLessThanOrEqual(tightBudget + 60);
+  });
+  test("no information-dense middle -> today's head/tail, no excerpt", () => {
+    const body = `HEAD${"m".repeat(40000)}TAIL`;
+    const text = serializeForSummary([{ role: "toolResult", content: [{ type: "text", text: body }] }]);
+    expect(text).toContain(`[+${body.length - SUMMARY_PROFILE.full.resultHead - SUMMARY_PROFILE.full.resultTail} chars]`);
+    expect(text).not.toContain(" … ");
+    expect(text.length).toBeLessThan(SUMMARY_PROFILE.full.resultHead + SUMMARY_PROFILE.full.resultTail + 40);
   });
   test("short tool results are untouched", () => {
     expect(serializeForSummary([{ role: "toolResult", content: "small" }])).toBe("[Tool result]: small");
@@ -436,23 +478,53 @@ describe("main session first user message", () => {
 });
 
 describe("addressable pruned restore list", () => {
-  const tool = (id: string) => ({ type: "message", id, message: { role: "toolResult", toolCallId: id, toolName: "read", content: [{ type: "text", text: "🙂".repeat(9000) }] } });
+  const tool = (id: string, text = "🙂".repeat(9000)) => ({ type: "message", id, message: { role: "toolResult", toolCallId: id, toolName: "read", content: [{ type: "text", text }] } });
   const edit = (id: string) => ({ type: "context_edit", targetId: id, replacement: { content: [{ type: "text", text: `[tool_result pruned; raw entry ${id}; use read_tool_result]` }] } });
-  const setup = (n = 25) => {
-    const tools = Array.from({ length: n }, (_, j) => tool(`result-${j}`));
+  const setup = (n = 25, text?: (id: string) => string) => {
+    const tools = Array.from({ length: n }, (_, j) => tool(`result-${j}`, text?.(`result-${j}`)));
     const kept = tool("kept");
     return { branchEntries: [...tools, kept, ...tools.map(t => edit(t.id)), edit(kept.id)],
       preparation: { messagesToSummarize: tools.map(t => ({ ...t.message, ...edit(t.id).replacement })), turnPrefixMessages: [],
         firstKeptEntryId: kept.id, tokensBefore: 90000 } };
   };
-  test("newest 20 summarized results are addressable, kept results excluded", async () => {
-    const out = await summarize(input([reply(snapshot())], setup()));
+  // A pruned bash result whose only interesting line is in the middle, where a blind head/tail never looks.
+  const dense = (id: string) => `${"progress tick\n".repeat(800)}Error: ${id} failed at /work/proj/src/${id}.ts\n${"tail\n".repeat(200)}`;
+  const listOf = (summary: string) => summary.slice(summary.indexOf("\n\nPruned tool results (entryId"));
+  // The exact tail a committed snapshot carries; `pruned` follows whether the list is still there.
+  const tailText = (archive: string, pruned = false) => `\n\nOlder details: ${archive} (read it only if needed).\n\n${restoreBlock(archive, "archived", pruned)}`;
+  // Measure the real list on a short snapshot that cannot overflow, so a sized reply can overflow by a known amount.
+  const measure = async (s: any) => {
+    const i = input([reply(snapshot())], s);
+    i.preparation.previousSummary = "OLD SUMMARY";
+    const out = await summarize(i);
+    const archive = archivePath(i.sessionId);
+    expect(out.compaction.summary).toBe(snapshot() + tailText(archive, true) + listOf(out.compaction.summary));
+    return { sessionId: i.sessionId, archive, list: listOf(out.compaction.summary) };
+  };
+  const sized = (tokens: number) => snapshot() + "\n" + "x".repeat(Math.max(0, (tokens - textTokens(snapshot() + "\n")) * 4));
+  // Reply size that lands a few tokens over the cap (ceil rounding on both sides eats ~1 token of precision).
+  const justOver = (tail: string) => HARD_CAP - textTokens(tail) + 5;
+
+  test("newest entries carry a key slice; the 8-entry and 200-token caps hold", async () => {
+    const out = await summarize(input([reply(snapshot())], setup(12, dense)));
+    const list = listOf(out.compaction.summary);
+    const entries = list.split("\n").filter(l => /^result-\d+ read \d+: /.test(l));
+    expect(out.compaction.summary).toContain("pruned tool results are listed below with a key slice");
+    expect(out.compaction.summary).toContain("8192 codepoints per call");
+    expect(entries.length).toBeLessThanOrEqual(8);
+    expect(entries[0]).toMatch(/^result-11 read \d+: Error: result-11 failed at \/work\/proj\/src\/result-11\.ts$/);
+    expect(entries.map(l => l.split(" ")[0])).toEqual(entries.map((_, i) => `result-${11 - i}`)); // newest first
+    for (const line of entries) expect(line.slice(line.indexOf(": ") + 2).length).toBeLessThanOrEqual(120);
+    expect(textTokens(list)).toBeLessThanOrEqual(LIST_BUDGET); // header, entries and "+N more" are inside the budget
+    expect(list.endsWith(`\n+${12 - entries.length} more`)).toBe(true);
+  });
+  test("summarized results are addressable, kept results excluded", async () => {
+    const out = await summarize(input([reply(snapshot())], setup(25)));
     const text = out.compaction.summary;
-    expect(text).toContain("pruned tool results listed below");
-    expect(text).toContain("result-24 read 9000\nresult-23 read 9000");
-    expect(text).toContain("result-5 read 9000\n+5 more");
-    expect(text).not.toContain("result-4 read");
-    expect(text).not.toContain("kept read");
+    const entries = listOf(text).split("\n").filter(l => /^result-\d+ read \d+: /.test(l));
+    expect(entries[0]).toStartWith("result-24 read 9000: ");
+    expect(entries.length).toBeLessThanOrEqual(8);
+    expect(text.slice(text.indexOf("result-24"))).not.toContain("kept read");
     expect(text.split("\n").filter(l => l.startsWith("## "))).toHaveLength(8);
     expect(out.tokens).toBe(textTokens(text));
   });
@@ -464,28 +536,57 @@ describe("addressable pruned restore list", () => {
     i.branchEntries.push({ type: "compaction", firstKeptEntryId: "result-1" } as any);
     i.preparation.messagesToSummarize.push(tool("old").message);
     const text = (await summarize(input([reply(snapshot())], i))).compaction.summary;
-    expect(text).toContain("result-1 read 9000");
+    expect(text).toContain("result-1 read 9000:");
     for (const id of ["result-0", "result-2", "result-3", "old", "kept"]) expect(text).not.toContain(`${id} read`);
   });
   test("no listed results: restore wording only covers markers still visible in kept messages", async () => {
     const text = (await summarize(input([reply(snapshot())]))).compaction.summary;
     expect(text).toContain("pruned tool-result markers still visible in kept messages");
-    expect(text).not.toContain("pruned tool results listed below");
+    expect(text).not.toContain("pruned tool results are listed below");
     expect(text).not.toContain("Pruned tool results (entryId");
   });
-  test("near-cap model output drops the 20-entry list without condensing", async () => {
-    const raw = snapshot() + `\n${"x".repeat(31000)}`;
-    const i = input([reply(raw)], setup(20));
+  test("an overflow the list itself covers drops only the list: one model call, pointer kept", async () => {
+    const s = setup(20);
+    const { sessionId, archive, list } = await measure(s);
+    const i = input([reply(sized(justOver(tailText(archive) + list)))], { ...s, sessionId });
     i.preparation.previousSummary = "OLD SUMMARY";
-    expect(textTokens(raw)).toBeLessThan(HARD_CAP);
     const out = await summarize(i);
     expect(calls).toHaveLength(1);
     expect(out.condensed).toBe(false);
     expect(out.compaction.summary).not.toContain("Pruned tool results (entryId");
-    expect(out.compaction.summary).not.toContain("pruned tool results listed below");
-    expect(out.compaction.summary).toContain("pruned tool-result markers still visible in kept messages");
-    expect(out.compaction.summary).toContain("Older details:");
+    expect(out.compaction.summary).toContain("Older details:"); // the archive pointer was not the thing to sacrifice
     expect(out.tokens).toBeLessThanOrEqual(HARD_CAP);
+  });
+  test("a larger overflow condenses once and keeps the list", async () => {
+    const s = setup(20);
+    const { sessionId, archive, list } = await measure(s);
+    const i = input([reply(snapshot("word ".repeat(8000))), reply(snapshot())], { ...s, sessionId });
+    i.preparation.previousSummary = "OLD SUMMARY";
+    const out = await summarize(i);
+    expect(calls).toHaveLength(2);
+    expect(out.condensed).toBe(true);
+    expect(out.compaction.summary).toContain("Pruned tool results (entryId");
+    expect(out.compaction.summary).toContain("Older details:");
+    // The condense call had the reserved list price deducted from its budget.
+    expect(calls[1].ctx.systemPrompt).toContain(`Total budget: <= ${6000 - textTokens(tailText(archive, true) + list)} tokens`);
+  });
+  test("condense still over: the pointer goes before the list", async () => {
+    const s = setup(20);
+    const { sessionId, archive, list } = await measure(s);
+    // Sized to overflow with the pointer, to fit without it: the list has to survive this round.
+    const i = input([reply(snapshot("word ".repeat(8000))), reply(sized(justOver(tailText(archive, true) + list)))], { ...s, sessionId });
+    i.preparation.previousSummary = "OLD SUMMARY";
+    const out = await summarize(i);
+    expect(calls).toHaveLength(2);
+    expect(out.condensed).toBe(true);
+    expect(out.compaction.summary).not.toContain("Older details:");
+    expect(out.compaction.summary).toContain(`older snapshots in ${archive}`); // the path is still named
+    expect(out.compaction.summary).toContain("Pruned tool results (entryId");
+    expect(out.tokens).toBeLessThanOrEqual(HARD_CAP);
+  });
+  test("condense still over after the pointer drop -> fallback", async () => {
+    const big = snapshot("word ".repeat(8000));
+    await fails(summarize(input([reply(big), reply(big)], setup(20))), "over-cap");
   });
   test("tail including the restore list is deducted from the first model budget", async () => {
     const i = input([reply(snapshot())], setup(20));
@@ -494,31 +595,6 @@ describe("addressable pruned restore list", () => {
     const tail = out.compaction.summary.slice(snapshot().length);
     expect(tail).toContain("Pruned tool results (entryId");
     expect(calls[0].ctx.systemPrompt).toContain(`Total budget: <= ${6000 - textTokens(tail)} tokens`);
-  });
-  test("drops the redundant Older details line before condensing, keeping the archive path", async () => {
-    const i = input([], setup(20));
-    i.preparation.previousSummary = "OLD SUMMARY";
-    const tail = `\n\n${restoreBlock(archivePath(i.sessionId), "archived")}`;
-    const base = snapshot() + "\n";
-    const raw = base + "x".repeat((HARD_CAP - textTokens(tail) - textTokens(base) - 2) * 4);
-    i.complete = async (_m: any, ctx: any, opts: any) => { calls.push({ ctx, opts }); return reply(raw); };
-    const out = await summarize(i);
-    expect(calls).toHaveLength(1);
-    expect(out.condensed).toBe(false);
-    expect(out.compaction.summary).not.toContain("Pruned tool results (entryId");
-    expect(out.compaction.summary).not.toContain("Older details:");
-    expect(out.compaction.summary).toContain(`older snapshots in ${archivePath(i.sessionId)}`);
-    expect(out.tokens).toBeLessThanOrEqual(HARD_CAP);
-  });
-  test("condenses only when even the minimal tail exceeds the hard cap", async () => {
-    const raw = snapshot("word ".repeat(7920 * 4 / 5 / 8));
-    expect(textTokens(raw)).toBeLessThanOrEqual(HARD_CAP);
-    const out = await summarize(input([reply(raw), reply(snapshot())], setup()));
-    expect(out.condensed).toBe(true);
-    expect(calls).toHaveLength(2);
-    expect(out.compaction.summary).not.toContain("Pruned tool results (entryId");
-    expect(out.compaction.summary).toContain("pruned tool-result markers still visible in kept messages");
-    expect(out.tokens).toBeLessThanOrEqual(HARD_CAP);
   });
 });
 

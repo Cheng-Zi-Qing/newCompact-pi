@@ -9,7 +9,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ModelRegistry, ModelRuntime, SessionManager, buildSessionProjection, convertToLlm } from "@earendil-works/pi-coding-agent";
-import { archivePath, restoreBlock } from "../src/summary.ts";
+import { archivePath, LIST_MAX, restoreBlock, restoreListText } from "../src/summary.ts";
 import { textTokens } from "../src/estimate.ts";
 
 const CONDS = ["raw", "snap", "snap+restore"] as const;
@@ -82,9 +82,7 @@ export function prunedInRange(branch: any[], start: number, end: number) {
 }
 
 export function restoreList(pruned: Candidate["pruned"]): string {
-  if (!pruned.length) return "";
-  return `\n\nPruned tool results (entryId toolName originalChars):\n${pruned.slice(0, 20).map(p => `${p.id} ${p.toolName} ${p.chars}`).join("\n")}` +
-    (pruned.length > 20 ? `\n+${pruned.length - 20} more` : "");
+  return restoreListText(pruned.map(p => ({ id: p.id, toolName: p.toolName, chars: p.chars, text: p.raw })));
 }
 
 export function readSession(file: string): { cwd: string; sessionId: string; branch: any[] } | undefined {
@@ -147,8 +145,8 @@ export function buildSnap(c: Candidate): string {
 export function buildSnapRestore(c: Candidate): string {
   const snap = buildSnap(c);
   if (!c.pruned.length) return snap;
-  // A model following the pointers one read_tool_result call per result recovers at most 8192 codepoints each.
-  const recovered = c.pruned.slice(0, 20).map(p => `# ${p.id} ${p.toolName} (${p.chars} chars)\n${Array.from(p.raw).slice(0, RESTORE_HEAD_LIMIT).join("")}`);
+  // A model following the pointers one read_tool_result call per listed result recovers at most 8192 codepoints each.
+  const recovered = c.pruned.slice(0, LIST_MAX).map(p => `# ${p.id} ${p.toolName} (${p.chars} chars)\n${Array.from(p.raw).slice(0, RESTORE_HEAD_LIMIT).join("")}`);
   return `${snap}\n\nRecovered pruned tool results:\n<<<\n${recovered.join("\n\n")}\n>>>`;
 }
 
@@ -394,8 +392,8 @@ async function main() {
     let record = cache.sessions[key];
     if (!record) {
       record = { file: c.file, sessionId: c.sessionId, cwd: c.cwd, compactionId: c.compactionId, compactions: c.compactions,
-        discardedTokens: c.discardedTokens, snapshotTokens: c.snapshotTokens, recoverable: c.pruned.slice(0, 20).reduce((n, p) => n + Math.min(p.chars, RESTORE_HEAD_LIMIT), 0),
-        prunedListed: Math.min(20, c.pruned.length), archived: c.archived, model: spec, truncated: c.truncated };
+        discardedTokens: c.discardedTokens, snapshotTokens: c.snapshotTokens, recoverable: c.pruned.slice(0, LIST_MAX).reduce((n, p) => n + Math.min(p.chars, RESTORE_HEAD_LIMIT), 0),
+        prunedListed: Math.min(LIST_MAX, c.pruned.length), archived: c.archived, model: spec, truncated: c.truncated };
       cache.sessions[key] = record;
     }
     if (!record.pairs) {
@@ -530,7 +528,8 @@ function selftest() {
     discardedText: "d", discardedTokens: 1, snapshotTokens: 1, pruned: [{ id: "e2", toolName: "bash", chars: 20000, raw }],
     archived: false, archive: "/tmp/archive.md", model: "p/m", truncated: false };
   const snap = buildSnap(candidate);
-  assert(snap.includes("Restorable:") && snap.includes("Pruned tool results (entryId toolName originalChars):\ne2 bash 20000"), "snapshot tail lists the addressable result");
+  assert(snap.includes("Restorable:") && snap.includes("Pruned tool results (entryId toolName originalChars: key slice") &&
+    /\ne2 bash 20000: .*xxx/.test(snap), "snapshot tail lists the addressable result with a key slice");
   assert(!snap.includes("Older details:"), "no archive pointer when nothing is archived");
   assert(buildSnapRestore(candidate).length > snap.length, "restore adds recovered text");
   assert(buildSnapRestore(candidate).includes("x".repeat(100)), "recovered text present");

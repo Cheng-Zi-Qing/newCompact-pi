@@ -237,7 +237,9 @@ test("benchmark crush#2382: low-value tool noise is pruned before it reaches the
   // so pruning buys ~nothing here (measured: 1 token) — its saving is in the live context below.
   const originalInput = textTokens(serializeForSummary(convertToLlm(before.messages), "full"));
   const prunedInput = textTokens(serializeForSummary(convertToLlm(prunedProjection.messages), "full"));
-  expect(prunedInput).toBeLessThanOrEqual(originalInput);
+  // The pruned marker carries its own entry id, which now counts as a dense line and survives the cut; pruning
+  // must still not inflate the summarizer input beyond that address.
+  expect(prunedInput).toBeLessThanOrEqual(originalInput + 25);
   expect(prunedInput).toBeLessThanOrEqual(textTokens(serializeConversation(convertToLlm(prunedProjection.messages))) * 0.7);
   const live = (branch: any[], projection: any) => effectiveContextTokens(branch, projection);
   expect(live(prunedManager.getBranch(), prunedProjection)).toBeLessThan(live(f.sm.getBranch(), before) - 10_000); // the real saving
