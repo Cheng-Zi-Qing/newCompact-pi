@@ -3,25 +3,30 @@
 // and how much do the current artifacts (snapshot + pointers + pruned tool results) help?
 // Read-only: reads session files and model metadata; never writes into ~/.pi except the cache file under --out.
 // usage: bun scripts/eval-retention.ts [session.jsonl ...] [--questions N] [--sessions N] [--out path]
-//        [--model provider/model[:thinking]] [--concurrency N] [--plan] [--selftest]
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+//        [--model provider/model[:thinking]] [--concurrency N] [--plan] [--selftest] [--resnapshot]
+import { mkdtempSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { ModelRegistry, ModelRuntime, SessionManager, buildSessionProjection, convertToLlm } from "@earendil-works/pi-coding-agent";
-import { archivePath, LIST_MAX, restoreBlock, restoreListText } from "../src/summary.ts";
+import { ModelRegistry, ModelRuntime, SessionManager, buildSessionProjection, convertToLlm, prepareBranchEntries } from "@earendil-works/pi-coding-agent";
+import { LIST_MAX, archivePath, restoreBlock, restoreListText, summarize } from "../src/summary.ts";
+// The restore-list header src/summary.ts writes before each entry; duplicated here so product code stays untouched.
+const LIST_HEADER = "Pruned tool results (entryId toolName originalChars: key slice):";
 import { textTokens } from "../src/estimate.ts";
+import { BUDGET } from "../src/guard.ts";
 
 const CONDS = ["raw", "snap", "snap+restore"] as const;
-export type Cond = typeof CONDS[number];
+// Round 2 only: the same snapshot regenerated with the current summarize(), plus its own restore list recovered.
+const NEW_CONDS = ["snap:new", "snap:new+restore"] as const;
+export type Cond = typeof CONDS[number] | typeof NEW_CONDS[number];
 const PRUNED_MARK = "[tool_result pruned; raw entry ";
 const RESTORE_HEAD_LIMIT = 8192; // one read_tool_result call returns at most this many codepoints
 const RAW_TOKEN_CAP = 200_000;
 
 // ---------- args ----------
-type Args = { files: string[]; questions: number; sessions: number; out: string; model?: string; concurrency: number; plan: boolean; selftest: boolean };
+type Args = { files: string[]; questions: number; sessions: number; out: string; model?: string; concurrency: number; plan: boolean; selftest: boolean; resnapshot: boolean };
 export function parseArgs(argv: string[]): Args {
-  const args: Args = { files: [], questions: 6, sessions: 5, concurrency: 2, plan: false, selftest: false,
+  const args: Args = { files: [], questions: 6, sessions: 5, concurrency: 2, plan: false, selftest: false, resnapshot: false,
     out: path.join(homedir(), ".pi/agent/.eval-retention/cache.json") };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -34,6 +39,7 @@ export function parseArgs(argv: string[]): Args {
     else if (a === "--model") args.model = value();
     else if (a === "--plan") args.plan = true;
     else if (a === "--selftest") args.selftest = true;
+    else if (a === "--resnapshot") args.resnapshot = true;
     else if (a.startsWith("--")) throw new Error(`Unknown flag ${a}`);
     else args.files.push(a);
   }
@@ -142,16 +148,63 @@ export function buildSnap(c: Candidate): string {
   return `${c.summary}${older}\n\n${restoreBlock(c.archive, c.archived ? "archived" : "none", c.pruned.length > 0)}${restoreList(c.pruned)}`;
 }
 
-export function buildSnapRestore(c: Candidate): string {
-  const snap = buildSnap(c);
-  if (!c.pruned.length) return snap;
+export function buildSnapRestoreFrom(snap: string, refs: Candidate["pruned"]): string {
+  if (!refs.length) return snap;
   // A model following the pointers one read_tool_result call per listed result recovers at most 8192 codepoints each.
-  const recovered = c.pruned.slice(0, LIST_MAX).map(p => `# ${p.id} ${p.toolName} (${p.chars} chars)\n${Array.from(p.raw).slice(0, RESTORE_HEAD_LIMIT).join("")}`);
+  const recovered = refs.slice(0, LIST_MAX).map(p => `# ${p.id} ${p.toolName} (${p.chars} chars)\n${Array.from(p.raw).slice(0, RESTORE_HEAD_LIMIT).join("")}`);
   return `${snap}\n\nRecovered pruned tool results:\n<<<\n${recovered.join("\n\n")}\n>>>`;
 }
 
-export function contexts(c: Candidate): Record<Cond, string> {
-  return { raw: c.discardedText, snap: buildSnap(c), "snap+restore": buildSnapRestore(c) };
+export function buildSnapRestore(c: Candidate): string {
+  return buildSnapRestoreFrom(buildSnap(c), c.pruned);
+}
+
+/** The results a generated snapshot's own restore list points at: `<entryId> <toolName> <chars>: <slice>`. */
+export function restoreRefsOf(summary: string, branch: any[]): Candidate["pruned"] {
+  const at = summary.indexOf(LIST_HEADER);
+  if (at < 0) return [];
+  const byId = new Map<string, any>(branch.map((e: any) => [e.id, e]));
+  const refs: Candidate["pruned"] = [];
+  for (const line of summary.slice(at + LIST_HEADER.length).split("\n").slice(1)) {
+    if (!line.trim() || line.startsWith("+")) break;
+    const m = /^(\S+) (\S+) (\d+):/.exec(line);
+    const entry = m && byId.get(m[1]);
+    if (!entry) continue;
+    refs.push({ id: m![1], toolName: m![2], chars: Number(m![3]), raw: textOf(entry.message) });
+  }
+  return refs;
+}
+
+/**
+ * The preparation the plugin would hand to summarize() at this compaction point. Faithful choice: the cut is taken
+ * from the committed firstKeptEntryId (so the discarded range, and therefore the cached questions, stay identical)
+ * and the summarized messages come from the same projected entries prepareBoundaryCompaction flattens. A split turn's
+ * turn prefix is folded into messagesToSummarize: the union and document order are the same, serializeForSummary
+ * concatenates both anyway. fileOps comes from the same prepareBranchEntries call.
+ */
+export function preparationFor(c: Candidate) {
+  const branch = readSession(c.file)!.branch;
+  const end = branch.findIndex((e: any) => e.id === c.compactionId);
+  const compaction: any = branch[end];
+  const previous = branch.slice(0, end).findLast((e: any) => e.type === "compaction");
+  const start = previous ? branch.findIndex((e: any) => e.id === previous.firstKeptEntryId) : 0;
+  const kept = branch.findIndex((e: any) => e.id === compaction.firstKeptEntryId);
+  const messages = buildSessionProjection(branch.slice(start, kept)).messages.filter((m: any) => m.role !== "system");
+  const nested = messages.filter((m: any) => m.role === "toolResult").flatMap((m: any) => m.nestedCalls?.calls ?? []);
+  const fileOps = prepareBranchEntries([...messages.map((message: any) => ({ type: "message", message })),
+    { type: "message", message: { role: "assistant", content: nested.map((call: any) =>
+      ({ type: "toolCall", name: call.name, arguments: call.arguments })) } }] as any).fileOps;
+  return { branchEntries: branch.slice(0, end),
+    preparation: { firstKeptEntryId: compaction.firstKeptEntryId, messagesToSummarize: messages, turnPrefixMessages: [],
+      tokensBefore: compaction.tokensBefore, previousSummary: previous?.summary, fileOps } };
+}
+
+export function contexts(c: Candidate, newSummary?: string): Partial<Record<Cond, string>> {
+  const out: Partial<Record<Cond, string>> = { raw: c.discardedText, snap: buildSnap(c), "snap+restore": buildSnapRestore(c) };
+  if (newSummary === undefined) return out;
+  out["snap:new"] = newSummary;
+  out["snap:new+restore"] = buildSnapRestoreFrom(newSummary, restoreRefsOf(newSummary, readSession(c.file)?.branch ?? []));
+  return out;
 }
 
 // ---------- model calls ----------
@@ -286,7 +339,8 @@ type AnswerRecord = { answer: string; verdict?: string; reason?: string; exact?:
 type PairRecord = Pair & { category: string; conditions?: Partial<Record<Cond, AnswerRecord>> };
 type SessionRecord = { file: string; sessionId: string; cwd: string; compactionId: string; compactions: number;
   discardedTokens: number; snapshotTokens: number; recoverable: number; prunedListed: number; archived: boolean;
-  model: string; truncated: boolean; probeUsage?: Usage; pairs?: PairRecord[] };
+  model: string /* probe+judge spec, not the snapshot author */; snapshotModel?: string; truncated: boolean; probeUsage?: Usage; pairs?: PairRecord[];
+  newSummary?: string; newSnapshotTokens?: number; newListed?: number; newUsage?: Usage }; // --resnapshot only
 type Cache = { version: 1; model: string; sessions: Record<string, SessionRecord>; lastRun?: any };
 
 function loadCache(file: string): Cache {
@@ -393,7 +447,8 @@ async function main() {
     if (!record) {
       record = { file: c.file, sessionId: c.sessionId, cwd: c.cwd, compactionId: c.compactionId, compactions: c.compactions,
         discardedTokens: c.discardedTokens, snapshotTokens: c.snapshotTokens, recoverable: c.pruned.slice(0, LIST_MAX).reduce((n, p) => n + Math.min(p.chars, RESTORE_HEAD_LIMIT), 0),
-        prunedListed: Math.min(LIST_MAX, c.pruned.length), archived: c.archived, model: spec, truncated: c.truncated };
+        prunedListed: Math.min(LIST_MAX, c.pruned.length), archived: c.archived, model: spec, snapshotModel: c.model,
+        truncated: c.truncated };
       cache.sessions[key] = record;
     }
     if (!record.pairs) {
@@ -414,13 +469,61 @@ async function main() {
 
   if (!sessions.length) throw new Error(`No session could be probed. ${skipped.join("; ")}`);
 
+  const conds: Cond[] = args.resnapshot ? [...CONDS, ...NEW_CONDS] : [...CONDS];
+  const label: Record<Cond, string> = { raw: "RAW", snap: args.resnapshot ? "SNAP_OLD" : "SNAP",
+    "snap+restore": args.resnapshot ? "SNAP_OLD+RESTORE" : "SNAP+RESTORE", "snap:new": "SNAP_NEW", "snap:new+restore": "SNAP_NEW+RESTORE" };
+  // Regeneration writes an archive when there is a previous summary: keep it out of ~/.pi/agent.
+  if (args.resnapshot) process.env.PI_COMPACT_DIR = mkdtempSync(path.join(tmpdir(), "pi-compact-eval-"));
+  const snapUsage = { cost: 0, input: 0, output: 0, ms: 0 };
+  for (const session of sessions) {
+    if (!args.resnapshot) break;
+    const record = cache.sessions[session.key];
+    // Regenerate when missing or when the authoring model changed: cached SNAP_NEW answers belong to one snapshot text.
+    if (record.newSummary && record.snapshotModel === session.c.model) continue;
+    // The regenerated snapshot must be written by the session's own model, never by the probe/judge spec.
+    const spec = session.c.model;
+    if (!spec) { skipped.push(`${session.c.sessionId.slice(0, 8)}: no session model for the regenerated snapshot`); continue; }
+    const { model } = resolve(spec);
+    // summarize() drives its own model call: same pacing and retry as the probe calls.
+    const complete = async (m: any, ctx: any, options: any) => {
+      const body = (ctx?.messages ?? []).map((x: any) => Array.isArray(x.content)
+        ? x.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n") : String(x.content ?? "")).join("\n");
+      await pace(Math.min(RATE_TOKENS, textTokens(String(ctx?.systemPrompt ?? "")) + textTokens(body) + (options?.maxTokens ?? 0)));
+      return withRetry(() => registry.streamSimple(m, ctx, options).result());
+    };
+    const { branchEntries, preparation } = preparationFor(session.c);
+    process.stderr.write(`resnapshot: ${session.c.sessionId.slice(0, 8)} with ${spec} (${preparation.messagesToSummarize.length} messages)... `);
+    try {
+      const out = await summarize({ preparation, branchEntries, signal: new AbortController().signal, model, complete,
+        sessionId: session.c.sessionId, sessionFile: session.c.file, isSubagent: false, budget: BUDGET,
+        contextWindow: model.contextWindow });
+      const spent = out.compaction.usage ?? {};
+      if (record.newSummary) for (const pair of record.pairs ?? [])
+        for (const cond of NEW_CONDS) delete pair.conditions?.[cond]; // stale answers for the replaced snapshot
+      record.snapshotModel = spec;
+      record.newSummary = out.compaction.summary;
+      record.newSnapshotTokens = out.tokens;
+      record.newListed = restoreRefsOf(out.compaction.summary, branchEntries).length;
+      record.newUsage = { input: spent.input ?? 0, output: spent.output ?? 0, cached: spent.cacheRead ?? 0,
+        cost: spent.cost?.total ?? 0, ms: 0 };
+      snapUsage.input += record.newUsage.input; snapUsage.output += record.newUsage.output; snapUsage.cost += record.newUsage.cost;
+      saveCache(args.out, cache);
+      process.stderr.write(`ok (${record.snapshotTokens} -> ${out.tokens} tokens, ${record.newListed} restorable)\n`);
+    } catch (error) {
+      const why = error instanceof Error ? error.message : String(error);
+      process.stderr.write(`failed: ${why}\n`);
+      skipped.push(`${session.c.sessionId.slice(0, 8)}: resnapshot failed (${why.slice(0, 80)})`);
+    }
+  }
+
   // Answer + judge: one independent call per (pair, condition); the condition is never named to the judge.
   const jobs: Array<() => Promise<void>> = [];
   for (const session of sessions) {
-    const ctx = contexts(session.c);
+    const ctx = contexts(session.c, cache.sessions[session.key].newSummary);
     for (const pair of session.pairs) {
       pair.conditions ??= {};
-      const order = [...CONDS].sort((a, b) => hash(`${pair.question}${a}`) - hash(`${pair.question}${b}`));
+      const order = conds.filter(c => ctx[c] !== undefined)
+        .sort((a, b) => hash(`${pair.question}${a}`) - hash(`${pair.question}${b}`));
       for (const cond of order) {
         if (pair.conditions[cond]?.verdict) continue;
         jobs.push(async () => {
@@ -455,12 +558,14 @@ async function main() {
 
   // ---------- report ----------
   const usage = { cost: 0, input: 0, output: 0, ms: 0 };
-  const cond = Object.fromEntries(CONDS.map(c => [c, { n: 0, correct: 0, partial: 0, exact: 0, incorrectBy: {} as Record<string, number>, part: {} as Record<string, number> }])) as any;
-  const rows: string[][] = [["session", "cwd", "comp", "n", "RAW", "SNAP", "SNAP+RESTORE", "ratio", "recoverable"]];
+  const cond = Object.fromEntries(conds.map(c => [c, { n: 0, correct: 0, partial: 0, exact: 0, incorrectBy: {} as Record<string, number>,
+    part: {} as Record<string, number>, usage: { cost: 0, input: 0, output: 0, ms: 0 } }])) as any;
+  const rows: string[][] = [["session", "cwd", "comp", "n", ...conds.map(c => label[c]), "ratio(old)", "ratio(new)", "restorable", "snapshot by"]];
   for (const session of sessions) {
-    const per = Object.fromEntries(CONDS.map(c => [c, { n: 0, correct: 0, partial: 0, exact: 0 }])) as any;
+    const record = cache.sessions[session.key];
+    const per = Object.fromEntries(conds.map(c => [c, { n: 0, correct: 0, partial: 0, exact: 0 }])) as any;
     for (const pair of session.pairs) {
-      for (const c of CONDS) {
+      for (const c of conds) {
         const rec = pair.conditions?.[c];
         if (!rec?.verdict) continue;
         per[c].n++;
@@ -468,38 +573,47 @@ async function main() {
         if (rec.verdict !== "incorrect") per[c].partial++;
         if (rec.exact) per[c].exact++;
         usage.cost += rec.usage.cost; usage.input += rec.usage.input; usage.output += rec.usage.output; usage.ms += rec.usage.ms;
+        cond[c].usage.cost += rec.usage.cost; cond[c].usage.input += rec.usage.input;
+        cond[c].usage.output += rec.usage.output; cond[c].usage.ms += rec.usage.ms;
         if (rec.verdict !== "correct") {
           cond[c].incorrectBy[pair.category] = (cond[c].incorrectBy[pair.category] ?? 0) + 1;
           if (rec.verdict === "partial") cond[c].part[pair.category] = (cond[c].part[pair.category] ?? 0) + 1;
         }
       }
     }
-    for (const c of CONDS) { const p = per[c]; cond[c].n += p.n; cond[c].correct += p.correct; cond[c].partial += p.partial; cond[c].exact += p.exact; }
+    for (const c of conds) { const p = per[c]; cond[c].n += p.n; cond[c].correct += p.correct; cond[c].partial += p.partial; cond[c].exact += p.exact; }
     const n = per.raw.n;
     rows.push([session.c.sessionId.slice(0, 8), session.c.cwd, String(session.c.compactions), String(n),
-      `${pct(per.raw.correct, n)} (${pct(per.raw.partial, n)})`, `${pct(per.snap.correct, n)} (${pct(per.snap.partial, n)})`,
-      `${pct(per["snap+restore"].correct, n)} (${pct(per["snap+restore"].partial, n)})`,
+      ...conds.map(c => `${pct(per[c].correct, n)} (${pct(per[c].partial, n)})`),
       `${(session.c.discardedTokens / Math.max(1, session.c.snapshotTokens)).toFixed(1)}x`,
-      String(session.c.pruned.length)]);
+      record.newSnapshotTokens ? `${(session.c.discardedTokens / Math.max(1, record.newSnapshotTokens)).toFixed(1)}x` : "-",
+      record.newListed !== undefined ? `${record.newListed} / ${session.c.pruned.length}` : String(session.c.pruned.length),
+      record.snapshotModel ?? session.c.model ?? "?"]);
   }
   const nOverall = cond.raw.n;
-  rows.push(["overall", "", "", String(nOverall),
-    `${pct(cond.raw.correct, nOverall)} (${pct(cond.raw.partial, nOverall)})`,
-    `${pct(cond.snap.correct, nOverall)} (${pct(cond.snap.partial, nOverall)})`,
-    `${pct(cond["snap+restore"].correct, nOverall)} (${pct(cond["snap+restore"].partial, nOverall)})`, "", ""]);
+  rows.push(["overall", "", "", String(nOverall), ...conds.map(c => `${pct(cond[c].correct, nOverall)} (${pct(cond[c].partial, nOverall)})`), "", "", "", ""]);
 
   console.log(table(rows));
   console.log("\nexact-substring cross-check (correct, no judge):");
-  console.log(table([["condition", "exact hit", "judged correct", "n"], ...CONDS.map(c =>
-    [c, pct(cond[c].exact, cond[c].n), pct(cond[c].correct, cond[c].n), String(cond[c].n)])]));
+  console.log(table([["condition", "exact hit", "judged correct", "n"], ...conds.map(c =>
+    [label[c], pct(cond[c].exact, cond[c].n), pct(cond[c].correct, cond[c].n), String(cond[c].n)])]));
   console.log("\nfailed pairs by keyword category (incorrect, partial in parentheses):");
-  console.log(table([["condition", ...CATEGORIES.map(c => c)], ...CONDS.map(c =>
-    [c, ...CATEGORIES.map(k => `${String(cond[c].incorrectBy[k] ?? 0)} (${String(cond[c].part[k] ?? 0)})`)])]));
+  console.log(table([["condition", ...CATEGORIES.map(c => c)], ...conds.map(c =>
+    [label[c], ...CATEGORIES.map(k => `${String(cond[c].incorrectBy[k] ?? 0)} (${String(cond[c].part[k] ?? 0)})`)])]));
   console.log(`\ncalls: ${usage.input + usage.output} tokens in/out (${usage.input} in, ${usage.output} out), cost $${usage.cost.toFixed(4)}, ` +
     `summed call time ${(usage.ms / 1000).toFixed(0)}s, wall ${((performance.now() - started) / 1000).toFixed(0)}s`);
   console.log(`compression: discarded ${sessions.reduce((n, s) => n + s.c.discardedTokens, 0)} tokens -> snapshot ` +
     `${sessions.reduce((n, s) => n + s.c.snapshotTokens, 0)} tokens; recoverable pruned results ` +
-    `${sessions.reduce((n, s) => n + Math.min(20, s.c.pruned.length), 0)} (of ${sessions.reduce((n, s) => n + s.c.pruned.length, 0)} in range, head ${RESTORE_HEAD_LIMIT} codepoints each)`);
+    `${sessions.reduce((n, s) => n + Math.min(LIST_MAX, s.c.pruned.length), 0)} (of ${sessions.reduce((n, s) => n + s.c.pruned.length, 0)} in range, head ${RESTORE_HEAD_LIMIT} codepoints each)`);
+  console.log("\nspend by condition (cached answers are re-reported, not re-billed):");
+  console.log(table([["condition", "answers", "in tok", "out tok", "cost", "call time"], ...conds.map(c =>
+    [label[c], String(cond[c].n), String(cond[c].usage.input), String(cond[c].usage.output),
+      `$${cond[c].usage.cost.toFixed(4)}`, `${(cond[c].usage.ms / 1000).toFixed(0)}s`])]));
+  if (args.resnapshot) console.log(`regenerated snapshots (session's own model, one summarize() call each): ` +
+    `${snapUsage.input} in / ${snapUsage.output} out tokens, cost $${snapUsage.cost.toFixed(4)}; ` +
+    `${sessions.filter(s => cache.sessions[s.key].newSnapshotTokens).length}/${sessions.length} regenerated, ` +
+    `new snapshots total ${sessions.reduce((n, s) => n + (cache.sessions[s.key].newSnapshotTokens ?? 0), 0)} tokens, ` +
+    `restorable now ${sessions.reduce((n, s) => n + (cache.sessions[s.key].newListed ?? 0), 0)} (of ${sessions.reduce((n, s) => n + s.c.pruned.length, 0)} in range)`);
   if (skipped.length) console.log(`skipped: ${skipped.join("; ")}`);
   console.log(`cache: ${args.out}`);
 
@@ -533,6 +647,9 @@ function selftest() {
   assert(!snap.includes("Older details:"), "no archive pointer when nothing is archived");
   assert(buildSnapRestore(candidate).length > snap.length, "restore adds recovered text");
   assert(buildSnapRestore(candidate).includes("x".repeat(100)), "recovered text present");
+  const refs = restoreRefsOf(snap, branch);
+  assert(refs.length === 1 && refs[0].id === "e2" && refs[0].raw.length === 20000, `restore list parsed back to the raw entry (${refs.length})`);
+  assert(buildSnapRestoreFrom(snap, refs) === buildSnapRestore(candidate), "restored context is the same whichever list it came from");
   const pairs = validPairs({ pairs: [
     { question: "q1", answer: "a1", sourceQuote: "not in text" },
     { question: "q2", answer: "42", sourceQuote: "kept 42" },
@@ -547,6 +664,7 @@ function selftest() {
   assert(parseJsonObject("```json\n{\"verdict\":\"correct\"}\n```").verdict === "correct", "JSON extraction");
   const parsedArgs = parseArgs(["--questions", "3", "a.jsonl", "--sessions", "2"]);
   assert(parsedArgs.questions === 3 && parsedArgs.sessions === 2 && parsedArgs.files[0] === "a.jsonl", "arg parsing");
+  assert(!parsedArgs.resnapshot && parseArgs(["--resnapshot"]).resnapshot === true, "resnapshot is opt-in");
   assert(/\/\.eval-retention\/cache\.json$/.test(parseArgs([]).out), "default cache lives outside the repo");
   console.log("selftest ok");
 }
