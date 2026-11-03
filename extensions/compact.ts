@@ -102,7 +102,7 @@ export default function piCompact(pi: ExtensionAPI) {
       log({ ...base, streak: d.streak, budget: d.budget, summaryTokens: out.tokens, result: out.condensed ? "condensed" : out.compressed ? "compressed" : "ok" });
       return { compaction: out.compaction };
     } catch (error) {
-      s.compacting = false; // pi's session_compact_failed also clears it, but a hook that never reaches pi must not wedge the session
+      s.compacting = false; // attempt still blocks usage/boundary via busy() until pi emits session_compact(_failed) for the native summary
       log({ ...base, streak: d.streak, result: `fallback:${error instanceof Fallback ? error.message : "error"}` });
       return; // pi runs its native summary; never cancel here
     }
@@ -152,15 +152,17 @@ export default function piCompact(pi: ExtensionAPI) {
       if (d.action !== "run") return skip(d.action === "abort" ? "abort" : "paused");
       attempted = true;
       s.compacting = true;
+      let after = 0;
       const out = await summarize({ preparation, branchEntries: preview.getBranch(), signal, model: ctx.model,
         complete: (m, c, o) => ctx.modelRegistry.streamSimple(m, c, o).result(), contextWindow: window,
-        sessionId: base.session, sessionFile: ctx.sessionManager.getSessionFile(), isSubagent: base.sub, budget: d.budget });
-      if (signal.aborted) throw new Fallback("aborted");
+        sessionId: base.session, sessionFile: ctx.sessionManager.getSessionFile(), isSubagent: base.sub, budget: d.budget,
+        validate: compaction => {
+          const compacted = replay(ctx, [...event.entries, { type: "compaction", ...compaction }]);
+          after = effectiveContextTokens(compacted.getBranch(), compacted.buildSessionProjection());
+          // Preempt native mid-run compaction only when the refreshed projection is below both lines.
+          if (after >= line) throw new Fallback("no-reduction");
+        } });
       const entries = [...event.entries, { type: "compaction" as const, ...out.compaction }];
-      const compacted = replay(ctx, entries);
-      const after = effectiveContextTokens(compacted.getBranch(), compacted.buildSessionProjection());
-      // Preempt native mid-run compaction only when the refreshed projection is below both lines.
-      if (after >= line) throw new Fallback("no-reduction");
       // shortcut: boundary drafts have no commit callback; counters assume later handlers accept this validated draft.
       committed(s, Date.now());
       log({ ...base, tokensBefore: total, tokensAfter: after, limit: line, summaryTokens: out.tokens, result: "boundary-compact" });

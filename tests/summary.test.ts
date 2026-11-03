@@ -9,7 +9,7 @@ process.env.PI_COMPACT_DIR = tmp;
 const prodLog = path.join(os.homedir(), ".pi/agent/pi-compact.log");
 const prodLogBefore = existsSync(prodLog) ? statSync(prodLog).mtimeMs : null;
 
-const { summarize, SECTIONS, Fallback, archivePath, dataDir, taskBrief, HARD_CAP, BRIEF_CAP, serializeForSummary, SUMMARY_PROFILE, checkStructure, insertBrief } = await import("../src/summary.ts");
+const { summarize, SECTIONS, Fallback, archivePath, dataDir, taskBrief, HARD_CAP, BRIEF_CAP, MAIN_BRIEF_CAP, serializeForSummary, SUMMARY_PROFILE, checkStructure, insertBrief } = await import("../src/summary.ts");
 const { textTokens } = await import("../src/estimate.ts");
 
 const model = { id: "m", provider: "p", api: "openai-responses", reasoning: true, contextWindow: 128000, maxTokens: 16384 };
@@ -61,6 +61,41 @@ describe("summarize", () => {
     expect(out.compaction.summary).toContain("read_tool_result(entryId, offset, limit)");
     expect(out.compaction.summary).toContain(archivePath(i.sessionId));
     expect(out.compaction.summary.split("\n").filter(l => l.startsWith("## ")).length).toBe(8);
+  });
+  test("failed attempts never append previous summaries", async () => {
+    for (const failure of ["model", "structure", "over-cap", "abort", "length"]) {
+      const big = snapshot("word ".repeat(8000));
+      const ac = new AbortController();
+      const i = input([reply(snapshot())], { signal: ac.signal });
+      // Keep an existing archive too: failures must not duplicate its sections.
+      await summarize(i);
+      const before = readFileSync(archivePath(i.sessionId), "utf8");
+      i.complete = async () => {
+        if (failure === "model") throw new Error("model failed");
+        if (failure === "abort") ac.abort();
+        return reply(failure === "structure" ? "bad structure" : failure === "over-cap" ? big : snapshot(), failure === "length" ? "length" : "stop");
+      };
+      expect(await summarize(i).then(() => false, () => true)).toBe(true);
+      expect(readFileSync(archivePath(i.sessionId), "utf8")).toBe(before);
+    }
+  });
+  test("archive write failure reuses the model text without any pointer", async () => {
+    const dir = process.env.PI_COMPACT_DIR;
+    process.env.PI_COMPACT_DIR = "/dev/null/blocked";
+    try {
+      const i = input([reply(snapshot())]);
+      const out = await summarize(i);
+      expect(calls).toHaveLength(1);
+      expect(out.compaction.summary).toContain("not archived (write failed)");
+      expect(out.compaction.summary).not.toContain(archivePath(i.sessionId));
+      expect(out.tokens).toBeLessThanOrEqual(HARD_CAP);
+    } finally { process.env.PI_COMPACT_DIR = dir; }
+  });
+  test("an earlier archive remains addressable with no previous summary this time", async () => {
+    const i = input([reply(snapshot()), reply(snapshot())]);
+    await summarize(i);
+    i.preparation.previousSummary = undefined as any;
+    expect((await summarize(i)).compaction.summary).toContain(archivePath(i.sessionId));
   });
   test("stop:length -> fallback", async () => { await fails(summarize(input([reply(snapshot(), "length")])), "stop:length"); });
   test("missing / reordered section -> fallback", async () => {
@@ -125,9 +160,13 @@ describe("serializeForSummary", () => {
     ]);
     expect(text).toBe("[User]: hello\n\n[Assistant]: working\n\n[Assistant tool calls]: read(path=/a.ts)\n\n[Tool result]: file body");
   });
-  test("user text is never truncated", () => {
-    const long = "u".repeat(10000);
-    expect(serializeForSummary([user(long)])).toBe(`[User]: ${long}`);
+  test("only tight caps user text, keeping authorizations at both ends", () => {
+    const long = `AUTHORIZED START${"u".repeat(10000)}DO NOT PUSH`;
+    expect(serializeForSummary([user(long)], "full")).toBe(`[User]: ${long}`);
+    const tight = serializeForSummary([user(long)], "tight");
+    expect(tight).toContain(`[+${long.length - 4000} chars of user text omitted]`);
+    expect(tight).toContain("AUTHORIZED START");
+    expect(tight.endsWith("DO NOT PUSH")).toBe(true);
   });
   test("assistant text is capped per profile, thinking is dropped", () => {
     const msg = { role: "assistant", content: [{ type: "thinking", thinking: "secret reasoning" }, { type: "text", text: "t".repeat(9000) }] };
@@ -190,6 +229,16 @@ describe("capacity degrade", () => {
   const big = () => ({ role: "assistant", content: [{ type: "text", text: "y".repeat(5000) }] });
   const flood = (n: number) => ({ preparation: { messagesToSummarize: [user("go"), ...Array.from({ length: n }, big)], turnPrefixMessages: [],
     firstKeptEntryId: "aaaaaaaa", tokensBefore: 90000, previousSummary: "OLD SUMMARY", fileOps: {} } });
+  test("a huge user paste cannot fit full but fits tight with an omission marker", async () => {
+    const paste = `allow edits${"x".repeat(2_000_000)}do not push`;
+    const i = input([reply(snapshot())], { preparation: { messagesToSummarize: [user(paste)], turnPrefixMessages: [],
+      firstKeptEntryId: "aaaaaaaa", tokensBefore: 500_000 }, model });
+    const out = await summarize(i);
+    expect(out.compressed).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].ctx.messages[0].content[0].text).toContain("chars of user text omitted]");
+    expect(calls[0].ctx.messages[0].content[0].text).toContain("do not push");
+  });
   test("full over capacity, tight fits -> one call, compressed flag, no fallback", async () => {
     const i = input([reply(snapshot())], { ...flood(100), model: { ...model, contextWindow: 120000 } });
     const out = await summarize(i);
@@ -313,27 +362,80 @@ describe("subagent task brief", () => {
   });
 });
 
-describe("main session original request", () => {
+describe("main session first user message", () => {
   const entries = (request: string) => [{ type: "message", id: "22222222", message: user(request) }];
-  test("first user message kept verbatim as the original request", async () => {
+  test("first user message kept verbatim as context, not the current goal", async () => {
     const request = "Build X in /a/b.ts; run bun test; do not push.";
     const out = await summarize(input([reply(snapshot())], { isSubagent: false, branchEntries: entries(request) }));
     const goal = out.compaction.summary.split("## Authorization")[0];
-    expect(goal).toContain("Original request (verbatim, from user):");
+    expect(goal).toContain("Session's first user message (verbatim; may be superseded by later requests):");
     expect(goal).toContain(request);
     expect(out.compaction.summary).not.toContain("Task brief (verbatim, from parent)");
   });
   test("no first user message -> no request block", async () => {
     const out = await summarize(input([reply(snapshot())], { isSubagent: false }));
-    expect(out.compaction.summary).not.toContain("Original request (verbatim");
+    expect(out.compaction.summary).not.toContain("Session's first user message");
   });
   test("the verbatim request comes out of the snapshot budget, so no condense call", async () => {
-    const request = "word ".repeat(1500).trim(); // ~1.9k tokens
+    const request = "word ".repeat(1500).trim(); // ~1.9k tokens before the main-only 600-token cap
     const out = await summarize(input([reply(snapshot())], { isSubagent: false, branchEntries: entries(request) }));
     expect(calls.length).toBe(1);
     expect(out.condensed).toBe(false);
     expect(calls[0].ctx.systemPrompt).not.toContain("<= 6000 tokens");
-    expect(calls[0].ctx.systemPrompt).toMatch(/Total budget: <= 4\d{3} tokens/);
+    expect(calls[0].ctx.systemPrompt).toMatch(/Total budget: <= 5\d{3} tokens/);
+    expect(calls[0].ctx.systemPrompt).toContain("Goal must state the CURRENT goal");
+    const brief = taskBrief(entries(request), undefined, "main")!;
+    expect(textTokens(brief)).toBeLessThanOrEqual(MAIN_BRIEF_CAP);
+    expect(brief).toContain("[truncated;");
+  });
+});
+
+describe("addressable pruned restore list", () => {
+  const tool = (id: string) => ({ type: "message", id, message: { role: "toolResult", toolCallId: id, toolName: "read", content: [{ type: "text", text: "🙂".repeat(9000) }] } });
+  const edit = (id: string) => ({ type: "context_edit", targetId: id, replacement: { content: [{ type: "text", text: `[tool_result pruned; raw entry ${id}; use read_tool_result]` }] } });
+  const setup = (n = 25) => {
+    const tools = Array.from({ length: n }, (_, j) => tool(`result-${j}`));
+    const kept = tool("kept");
+    return { branchEntries: [...tools, kept, ...tools.map(t => edit(t.id)), edit(kept.id)],
+      preparation: { messagesToSummarize: tools.map(t => ({ ...t.message, ...edit(t.id).replacement })), turnPrefixMessages: [],
+        firstKeptEntryId: kept.id, tokensBefore: 90000 } };
+  };
+  test("newest 20 summarized results are addressable, kept results excluded", async () => {
+    const out = await summarize(input([reply(snapshot())], setup()));
+    const text = out.compaction.summary;
+    expect(text).toContain("pruned tool results listed below");
+    expect(text).toContain("result-24 read 9000\nresult-23 read 9000");
+    expect(text).toContain("result-5 read 9000\n+5 more");
+    expect(text).not.toContain("result-4 read");
+    expect(text).not.toContain("kept read");
+    expect(text.split("\n").filter(l => l.startsWith("## "))).toHaveLength(8);
+    expect(out.tokens).toBe(textTokens(text));
+  });
+  test("later reverted/replaced edits and results outside this summary range are excluded", async () => {
+    const i = setup(4);
+    i.branchEntries.push({ type: "context_edit", targetId: "result-3", replacement: null } as any,
+      { type: "context_edit", targetId: "result-2", replacement: { content: [{ type: "text", text: "not pruned" }] } });
+    i.branchEntries.unshift(tool("old"), edit("old"));
+    i.branchEntries.push({ type: "compaction", firstKeptEntryId: "result-1" } as any);
+    i.preparation.messagesToSummarize.push(tool("old").message);
+    const text = (await summarize(input([reply(snapshot())], i))).compaction.summary;
+    expect(text).toContain("result-1 read 9000");
+    for (const id of ["result-0", "result-2", "result-3", "old", "kept"]) expect(text).not.toContain(`${id} read`);
+  });
+  test("no listed results: restore wording only covers markers still visible in kept messages", async () => {
+    const text = (await summarize(input([reply(snapshot())]))).compaction.summary;
+    expect(text).toContain("pruned tool-result markers still visible in kept messages");
+    expect(text).not.toContain("pruned tool results listed below");
+    expect(text).not.toContain("Pruned tool results (entryId");
+  });
+  test("restore list is charged to the assembled hard cap", async () => {
+    const raw = snapshot("word ".repeat(7920 * 4 / 5 / 8));
+    expect(textTokens(raw)).toBeLessThanOrEqual(HARD_CAP);
+    const out = await summarize(input([reply(raw), reply(snapshot())], setup()));
+    expect(out.condensed).toBe(true);
+    expect(calls).toHaveLength(2);
+    expect(out.compaction.summary).toContain("result-24 read 9000");
+    expect(out.tokens).toBeLessThanOrEqual(HARD_CAP);
   });
 });
 

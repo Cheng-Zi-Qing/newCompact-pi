@@ -1,5 +1,5 @@
 import { beforeEach, expect, mock, test } from "bun:test";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildSessionProjection, estimateTokens, SessionManager } from "@earendil-works/pi-coding-agent";
@@ -9,7 +9,8 @@ import { effectiveContextTokens, usageInputs } from "../src/usage.ts";
 import { estimateProjectedTokens } from "../src/estimate.ts";
 import { prepareBoundaryCompaction } from "../src/boundary.ts";
 import { committed, decide, resetStates, stateOf } from "../src/guard.ts";
-import { SECTIONS } from "../src/summary.ts";
+import { SECTIONS, archivePath } from "../src/summary.ts";
+import { hostModules } from "../scripts/host-modules.mjs";
 
 beforeEach(resetStates);
 const root = mkdtempSync(join(tmpdir(), "compact-boundary-"));
@@ -88,6 +89,7 @@ for (const sub of [false, true]) test(`boundary compacts after pruning and refre
   expect(entries.map(e => e.type)).toEqual(["context_edit", "compaction"]);
   expect(f.complete).toHaveBeenCalledTimes(1);
   expect(entries[1].summary).toContain("## Goal");
+  expect(entries[1].summary).toContain(`${f.tool} bash 60000`);
   if (sub) expect(entries[1].summary).toContain("Task brief (verbatim, from parent):");
   const projected = replay(f.ctx, entries);
   expect(effectiveContextTokens(projected.getBranch())).toBeLessThan(800_000);
@@ -138,6 +140,21 @@ test("boundary skips paused/busy/disabled/noncompleted/already-compacted states"
     expect(f.complete).not.toHaveBeenCalled();
   }
 });
+test("boundary no-reduction leaves the previous summary unarchived", async () => {
+  process.env.PI_COMPACT_DIR = root;
+  const f = fixture(60_000, 100, false, { compaction: { keepRecentTokens: 20_000 } });
+  const first = f.manager.getBranch().find(e => e.type === "message")!;
+  f.manager.appendCompaction(snapshot, first.id, 60_000, {}, true);
+  f.manager.appendMessage({ role: "user", content: "x".repeat(110_000), timestamp: 2 });
+  f.manager.appendMessage(assistant(60_000) as any);
+  f.ctx.model.contextWindow = 32_000;
+  f.ctx.getContextUsage = () => ({ contextWindow: 32_000 });
+  expect(await f.boundary()).toEqual([]);
+  expect(f.complete).toHaveBeenCalledTimes(1);
+  expect(logText()).toContain("result=boundary-fallback:no-reduction");
+  expect(existsSync(archivePath(f.manager.getSessionId()))).toBe(false);
+});
+
 test("boundary snapshot failure returns no compaction and releases the guard attempt", async () => {
   const f = fixture(965_689, 100);
   f.complete.mockImplementation(async () => ({ stopReason: "length", content: [] }));
@@ -186,7 +203,7 @@ test("invalid ratio uses default with one warning; valid custom ratio affects bo
   expect(custom.ctx.ui.notify).not.toHaveBeenCalled();
 });
 test("public cut preparation matches native keepRecentTokens for edited/split/system/previous-summary shapes", async () => {
-  const internalPath = join(process.env.HOME!, ".bun/install/global/node_modules/@earendil-works/pi-coding-agent/dist/core/compaction/compaction.js");
+  const internalPath = join(hostModules(), "@earendil-works/pi-coding-agent/dist/core/compaction/compaction.js");
   const { prepareCompaction } = await import(internalPath);
   const f = fixture();
   f.manager.appendContextEdit(f.tool, { content: [{ type: "text", text: "small" }] });

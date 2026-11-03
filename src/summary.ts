@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { convertToLlm, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { textTokens } from "./estimate.ts";
@@ -6,6 +6,7 @@ import { textTokens } from "./estimate.ts";
 export const OUTPUT_CAP = 12288;
 export const HARD_CAP = 8000;
 export const BRIEF_CAP = 2000;
+export const MAIN_BRIEF_CAP = 600;
 export const SECTIONS = ["Goal", "Authorization & Constraints", "Verified Progress", "Unfinished Work & Blockers",
   "Key Decisions", "Active Agents & Session State", "Evidence & Critical Context", "Next Steps"] as const;
 const MAIN_SPLIT = [300, 800, 1000, 1000, 800, 500, 1200, 400];
@@ -35,7 +36,7 @@ Rules:
 - Completed items: one line each, with evidence location (file path / test command / result). Merge old completed items into one line.
 - Delete superseded decisions, finished agents and loops, resolved blockers.
 - Keep user authorizations and prohibitions verbatim and deduplicated; never drop them to save space.
-- If the previous snapshot's Goal already holds the user's verbatim request, do not copy it into the new Goal; write only the current goal.
+- Goal must state the CURRENT goal. The session's first user message is context only and may be superseded by later requests; do not copy it into the current Goal.
 - Paths, IDs, commands, numbers only; never paste file contents.
 - Pointers (entry id / file path / command) beat pasted content: pruned tool results and archived snapshots stay retrievable, so a pointer loses nothing.
 - Mark unknown things as unknown; never invent facts.
@@ -84,10 +85,10 @@ const cut = (text: string, max: number) => {
 };
 
 // Bash errors land at the tail, so keep both ends instead of pi's head-only 2000 chars.
-function headTail(text: string, head: number, tail: number) {
+function headTail(text: string, head: number, tail: number, omitted = "chars") {
   if (text.length <= head + tail) return text;
   const end = safeIndex(text, head), start = safeIndex(text, text.length - tail);
-  return `${text.slice(0, end)}\n[+${start - end} chars]\n${text.slice(start)}`;
+  return `${text.slice(0, end)}\n[+${start - end} ${omitted}]\n${text.slice(start)}`;
 }
 
 const argValue = (v: any) => (typeof v === "string" ? v : JSON.stringify(v) ?? String(v));
@@ -98,7 +99,7 @@ export function serializeForSummary(messages: any[], profile: SummaryProfile = "
   for (const msg of messages) {
     if (msg?.role === "user") {
       const text = textOf(msg);
-      if (text) parts.push(`[User]: ${text}`);
+      if (text) parts.push(`[User]: ${profile === "tight" ? headTail(text, 3000, 1000, "chars of user text omitted") : text}`);
     } else if (msg?.role === "assistant") {
       const text = textOf(msg); // text blocks only: thinking is dropped
       if (text) parts.push(`[Assistant]: ${cut(text, p.text)}`);
@@ -114,30 +115,54 @@ export function serializeForSummary(messages: any[], profile: SummaryProfile = "
   return parts.join("\n\n");
 }
 
-// The subagent's first user message is the parent's task brief; a main session's is the user's original request.
-// Both go in verbatim up to BRIEF_CAP.
+// Main sessions keep a small context-only first message; subagents retain the parent's task brief.
 export function taskBrief(branchEntries: any[], sessionFile: string | undefined, kind: "subagent" | "main" = "subagent"): string | undefined {
   const first = branchEntries.find(e => e.type === "message" && e.message.role === "user");
   if (!first) return;
   let text = textOf(first.message);
   if (!text.trim()) return;
-  // Neither kind of session can carry the whole brief: it would push the snapshot over HARD_CAP and hand the
-  // compaction back to pi. Only a persisted session has a readable pointer; an in-memory one has none, say so.
-  if (textTokens(text) > BRIEF_CAP) {
-    let end = text.length;
-    while (end > 0 && textTokens(text.slice(0, end)) > BRIEF_CAP) end = Math.floor(end * 0.9);
+  const title = kind === "main" ? "Session's first user message (verbatim; may be superseded by later requests):" : "Task brief (verbatim, from parent):";
+  const wrap = (body: string) => `${title}\n<<<\n${body}\n>>>`;
+  const cap = kind === "main" ? MAIN_BRIEF_CAP : BRIEF_CAP;
+  const charge = (body: string) => textTokens(kind === "main" ? wrap(body) : body);
+  if (charge(text) > cap) {
     const where = sessionFile ? `full brief: ${sessionFile} entry ${first.id}` : "in-memory session, full text is not addressable";
-    text = `${text.slice(0, safeIndex(text, end))}\n[truncated; ${where}]`;
+    const marker = `\n[truncated; ${where}]`;
+    let end = text.length;
+    while (end > 0 && charge(text.slice(0, safeIndex(text, end)) + (kind === "main" ? marker : "")) > cap) end = Math.floor(end * 0.9);
+    text = `${text.slice(0, safeIndex(text, end))}${marker}`;
   }
-  const title = kind === "main" ? "Original request (verbatim, from user):" : "Task brief (verbatim, from parent):";
-  return `${title}\n<<<\n${text}\n>>>`;
+  return wrap(text);
 }
 
-// No "## " heading: headings must stay at exactly the 8 SECTIONS. Tells the model that compaction is reversible.
-// archived=false means the previous snapshot could not be written: say so instead of pointing at a missing file.
-export function restoreBlock(archive: string, archived = true) {
-  const where = archived ? `older snapshots in ${archive}` : "earlier snapshots were not archived (write failed), so this snapshot is the only record";
-  return `Restorable: ${where}; pruned tool results marked "[tool_result pruned; raw entry <id>; use read_tool_result]" reopen via read_tool_result(entryId, offset, limit) when that tool is enabled. Newer messages verbatim.`;
+export type ArchiveState = "archived" | "none" | "failed";
+// No heading: these pointers belong after the eight snapshot sections.
+export function restoreBlock(archive: string, state: ArchiveState, hasPruned = false) {
+  const where = state === "archived" ? `older snapshots in ${archive}; ` : state === "failed"
+    ? "earlier snapshots were not archived (write failed), so this snapshot is the only record; " : "";
+  const results = hasPruned ? "pruned tool results listed below, and markers still visible in kept messages," : "pruned tool-result markers still visible in kept messages";
+  return `Restorable: ${where}${results} reopen via read_tool_result(entryId, offset, limit) when that tool is enabled. Newer messages verbatim.`;
+}
+
+function prunedRestoreList(preparation: any, branch: any[]) {
+  const end = branch.findIndex(e => e.id === preparation.firstKeptEntryId);
+  if (end < 0) return "";
+  const previous = branch.findLast(e => e.type === "compaction");
+  const start = previous ? branch.findIndex(e => e.id === previous.firstKeptEntryId) : 0;
+  const summarized = [...preparation.messagesToSummarize, ...preparation.turnPrefixMessages];
+  const edits = new Map<string, any>();
+  for (const entry of branch) if (entry.type === "context_edit") edits.set(entry.targetId, entry.replacement);
+  const results = branch.slice(Math.max(0, start), end).filter(entry => {
+    const message = entry.message;
+    if (entry.type !== "message" || message?.role !== "toolResult") return false;
+    if (!summarized.some(m => m.role === "toolResult" && m.toolCallId === message.toolCallId && m.toolName === message.toolName)) return false;
+    const replacement = edits.get(entry.id);
+    return replacement && textOf(replacement).includes(`[tool_result pruned; raw entry ${entry.id}; use read_tool_result]`);
+  }).reverse();
+  if (!results.length) return "";
+  return `\n\nPruned tool results (entryId toolName originalChars):\n${results.slice(0, 20).map(e =>
+    `${e.id} ${e.message.toolName} ${Array.from(textOf(e.message)).length}`).join("\n")}` +
+    (results.length > 20 ? `\n+${results.length - 20} more` : "");
 }
 
 export function insertBrief(summary: string, brief: string) {
@@ -157,6 +182,7 @@ export type SummaryInput = {
   preparation: any; branchEntries: any[]; customInstructions?: string; signal: AbortSignal;
   model: any; complete: Complete; sessionId: string; sessionFile?: string; isSubagent: boolean; budget: number;
   contextWindow?: number; // fallback when the model reports none (e.g. virtual models)
+  validate?: (compaction: any) => void; // boundary projection check, before any archive write
 };
 
 async function call(input: SummaryInput, system: string, text: string) {
@@ -183,7 +209,7 @@ export async function summarize(input: SummaryInput) {
   const source = (profile: SummaryProfile) => `<previous-summary>\n${preparation.previousSummary ?? "(none)"}\n</previous-summary>\n\n<conversation>\n${serializeForSummary(messages, profile)}\n</conversation>` +
     (input.customInstructions ? `\n\nAdditional focus from the user: ${input.customInstructions}` : "");
   const brief = taskBrief(input.branchEntries, input.sessionFile, isSubagent ? "subagent" : "main");
-  // A main session's request is kept verbatim in Goal, so it comes out of the snapshot budget; subagents use SUB_SHARE instead.
+  // The context-only first message is charged to the main snapshot budget; subagents use SUB_SHARE instead.
   const promptBudget = !isSubagent && brief ? Math.max(3000, budget - textTokens(brief)) : budget;
   const system = prompt(promptBudget, isSubagent);
   const window = model.contextWindow || input.contextWindow;
@@ -198,19 +224,12 @@ export async function summarize(input: SummaryInput) {
   }
 
   const archive = archivePath(input.sessionId);
-  // A storage failure must never cost the snapshot: it only removes the pointer line. Archiving before the final
-  // cap/abort checks means a later fallback can leave an orphan archive section; the archive is not commit evidence.
-  let archived = !preparation.previousSummary;
-  if (preparation.previousSummary) {
-    try {
-      mkdirSync(path.dirname(archive), { recursive: true });
-      appendFileSync(archive, `\n\n# Archived ${new Date().toISOString()}\n\n${preparation.previousSummary}\n`);
-      archived = true;
-    } catch { archived = false; }
-  }
-  // The 8k cap applies to what is committed: snapshot + verbatim brief + archive and restore pointers.
+  // Reserve the successful archive pointer before validation; do not write until the whole attempt passes.
+  let archived: ArchiveState = preparation.previousSummary || existsSync(archive) ? "archived" : "none";
+  const restoreList = prunedRestoreList(preparation, input.branchEntries);
   const assemble = (text: string) => (brief ? insertBrief(text, brief) : text) +
-    (archived ? `\n\nOlder details: ${archive} (read it only if needed).` : "") + `\n\n${restoreBlock(archive, archived)}`;
+    (archived === "archived" ? `\n\nOlder details: ${archive} (read it only if needed).` : "") +
+    `\n\n${restoreBlock(archive, archived, !!restoreList)}${restoreList}`;
   let result = await call(input, system, sourceText);
   let summary = assemble(result.text);
   let condensed = false;
@@ -223,9 +242,21 @@ export async function summarize(input: SummaryInput) {
   if (textTokens(summary) > HARD_CAP) fallback("over-cap");
   if (signal.aborted) fallback("aborted");
 
-  return {
-    compaction: { summary, firstKeptEntryId: preparation.firstKeptEntryId, tokensBefore: preparation.tokensBefore,
-      details: fileLists(preparation, input.branchEntries), usage: result.usage },
-    tokens: textTokens(summary), condensed, compressed,
-  };
+  const compaction = { summary, firstKeptEntryId: preparation.firstKeptEntryId, tokensBefore: preparation.tokensBefore,
+    details: fileLists(preparation, input.branchEntries), usage: result.usage };
+  input.validate?.(compaction);
+  if (signal.aborted) fallback("aborted");
+  if (preparation.previousSummary) {
+    try {
+      mkdirSync(path.dirname(archive), { recursive: true });
+      appendFileSync(archive, `\n\n# Archived ${new Date().toISOString()}\n\n${preparation.previousSummary}\n`);
+    } catch {
+      archived = "failed";
+      summary = assemble(result.text);
+      if (textTokens(summary) > HARD_CAP) fallback("over-cap");
+      compaction.summary = summary;
+      input.validate?.(compaction);
+    }
+  }
+  return { compaction, tokens: textTokens(summary), condensed, compressed };
 }

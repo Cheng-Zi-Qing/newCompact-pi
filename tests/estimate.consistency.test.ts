@@ -6,7 +6,8 @@ import path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { estimateProjectedTokens } from "../src/estimate.ts";
 
-const internalPath = path.join(os.homedir(), ".bun/install/global/node_modules/@earendil-works/pi-coding-agent/dist/core/compaction/compaction.js");
+import { hostModules } from "../scripts/host-modules.mjs";
+const internalPath = path.join(hostModules(), "@earendil-works/pi-coding-agent/dist/core/compaction/compaction.js");
 const { estimateProjectedContextTokens: internal } = await import(internalPath);
 const internalSM = (await import(path.join(path.dirname(internalPath), "../session-manager.js"))).SessionManager;
 

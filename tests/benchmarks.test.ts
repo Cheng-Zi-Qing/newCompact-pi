@@ -6,6 +6,9 @@ import os from "node:os";
 import path from "node:path";
 import { convertToLlm, estimateTokens, SessionManager } from "@earendil-works/pi-coding-agent";
 
+import { hostModules } from "../scripts/host-modules.mjs";
+const { serializeConversation } = await import(path.join(hostModules(), "@earendil-works/pi-coding-agent/dist/core/compaction/utils.js"));
+
 process.env.PI_COMPACT_DIR = mkdtempSync(path.join(os.tmpdir(), "pi-compact-bench-"));
 const compact = (await import("../extensions/compact.ts")).default;
 const { usageDelay } = await import("../extensions/compact.ts");
@@ -71,20 +74,35 @@ function harness(window = 200_000, config: any = {}, replies: any[] = []) {
 const logText = () => readFileSync(path.join(process.env.PI_COMPACT_DIR!, "pi-compact.log"), "utf8");
 const logFor = (sessionId: string) => logText().split("\n").filter(l => l.includes(`session=${sessionId}`)).join("\n");
 
-test("benchmark claude-code#7502: snapshot always names a retrievable archive", async () => {
-  // claude-code#7502 (2025-09-12, 39👍): auto-compaction dropped the history with no warning and no way back.
-  const sessionId = "bench-7502";
+test("benchmark claude-code#7502: first compaction has no archive pointer", async () => {
+  const sessionId = "bench-7502-first";
   const out = await summarize({
-    preparation: { messagesToSummarize: [user("do the thing")], turnPrefixMessages: [], firstKeptEntryId: "aaaaaaaa",
-      tokensBefore: 90_000, previousSummary: "OLD SUMMARY", fileOps: {} },
+    preparation: { messagesToSummarize: [user("do the thing")], turnPrefixMessages: [], firstKeptEntryId: "aaaaaaaa", tokensBefore: 90_000 },
     branchEntries: [], signal: new AbortController().signal, model: model(200_000), sessionId, isSubagent: false, budget: 6000,
     complete: async () => ({ stopReason: "stop", content: [{ type: "text", text: snapshot }] }),
   });
+  expect(out.compaction.summary).not.toContain(archivePath(sessionId));
+  expect(out.compaction.summary).not.toContain("Older details:");
+  expect(existsSync(archivePath(sessionId))).toBe(false);
+});
+
+test("benchmark claude-code#7502: second compaction names an archive that exists", async () => {
+  // claude-code#7502 (2025-09-12, 39👍): auto-compaction dropped the history with no warning and no way back.
+  const sessionId = "bench-7502";
+  const i = {
+    preparation: { messagesToSummarize: [user("do the thing")], turnPrefixMessages: [], firstKeptEntryId: "aaaaaaaa",
+      tokensBefore: 90_000, previousSummary: undefined as string | undefined, fileOps: {} },
+    branchEntries: [], signal: new AbortController().signal, model: model(200_000), sessionId, isSubagent: false, budget: 6000,
+    complete: async () => ({ stopReason: "stop", content: [{ type: "text", text: snapshot }] }),
+  };
+  const first = await summarize(i);
+  i.preparation.previousSummary = first.compaction.summary;
+  const out = await summarize(i);
   const archive = archivePath(sessionId);
   expect(out.compaction.summary).toContain(archive);                                   // the snapshot names where the history went
   expect(out.compaction.summary).toContain("read_tool_result(entryId, offset, limit)"); // and how to reopen pruned results
   expect(existsSync(archive)).toBe(true);
-  expect(readFileSync(archive, "utf8")).toContain("OLD SUMMARY");                       // the dropped snapshot is really there
+  expect(readFileSync(archive, "utf8")).toContain(first.compaction.summary);                       // the dropped snapshot is really there
 });
 
 test("benchmark claude-code#66144: context past 100% of the window still snapshots", async () => {
@@ -106,9 +124,9 @@ test("benchmark claude-code#66144: context past 100% of the window still snapsho
 
 test("benchmark claude-code#18211: manual compaction over capacity never cancels", async () => {
   // claude-code#18211 (2026-01-14, 25👍): /compact answered "conversation too long" and auto-compaction was dead too.
-  const over = harness(200_000);
+  const over = harness(16_000);
   over.sm.appendMessage(user("go") as any);
-  // user text is never truncated, so even the tight profile cannot fit this input.
+  // Even tight cannot fit the fixed output/safety reserve in this small window.
   const cancelable = await over.beforeCompact("manual", over.preparation("x".repeat(2_000_000)));
   expect(cancelable).not.toEqual({ cancel: true });
   expect(cancelable).toBeUndefined();                      // pi's native summary takes over, the run is not cancelled
@@ -134,6 +152,12 @@ test("benchmark codex#4106: compaction.enabled=false keeps manual working", asyn
   expect(f.handlers.session_before_compact.length).toBe(1);
   const manual = await f.beforeCompact("manual", f.preparation("short request"));
   expect(manual.compaction.summary).toContain("## Goal"); // /compact still works: opt-out is about automation only
+  const enabled = harness(200_000, { compaction: { enabled: true, keepRecentTokens: 1000 } });
+  enabled.sm.appendMessage(user("task") as any);
+  enabled.sm.appendMessage(assistant(190_000) as any);
+  enabled.sm.appendMessage(user("t".repeat(8_000)) as any);
+  expect((await enabled.boundary()).map(e => e.type)).toContain("compaction");
+  expect(enabled.calls()).toBe(1);
 });
 
 test("benchmark opencode#8140: triggerRatio 0.5 compacts at half the window", async () => {
@@ -214,7 +238,7 @@ test("benchmark crush#2382: low-value tool noise is pruned before it reaches the
   const originalInput = textTokens(serializeForSummary(convertToLlm(before.messages), "full"));
   const prunedInput = textTokens(serializeForSummary(convertToLlm(prunedProjection.messages), "full"));
   expect(prunedInput).toBeLessThanOrEqual(originalInput);
-  expect(originalInput - prunedInput).toBeLessThan(originalInput * 0.01);
+  expect(prunedInput).toBeLessThanOrEqual(textTokens(serializeConversation(convertToLlm(prunedProjection.messages))) * 0.7);
   const live = (branch: any[], projection: any) => effectiveContextTokens(branch, projection);
   expect(live(prunedManager.getBranch(), prunedProjection)).toBeLessThan(live(f.sm.getBranch(), before) - 10_000); // the real saving
 });
@@ -294,7 +318,9 @@ test("benchmark billion-context#5531: repeated compaction keeps the snapshot bou
     sizes.push(out.tokens);
     previous = out.compaction.summary;
   }
-  expect(sizes.at(-1)!).toBeLessThanOrEqual(sizes[0] * 2);
+  expect(sizes.every(size => size <= HARD_CAP)).toBe(true);
+  const archive = readFileSync(archivePath("bench-5531"), "utf8");
+  expect(archive.match(/^# Archived /gm)).toHaveLength(5);
 });
 
 test("benchmark billion-context#5538: a stale estimate must not disable preflight compaction", async () => {
@@ -320,7 +346,7 @@ test("benchmark billion-context#5542: every degradation is observable in the log
     ["stop:length", [{ stopReason: "length", content: [] }]],
   ];
   for (const [expected, replies] of cases) {
-    const f = harness(200_000, { compaction: { keepRecentTokens: 1000 } }, replies);
+    const f = harness(expected === "capacity" ? 16_000 : 200_000, { compaction: { keepRecentTokens: 1000 } }, replies);
     f.sm.appendMessage(user("go") as any);
     const prep = expected === "capacity" ? f.preparation("x".repeat(2_000_000)) : f.preparation("short request");
     expect(await f.beforeCompact("manual", prep)).toBeUndefined();

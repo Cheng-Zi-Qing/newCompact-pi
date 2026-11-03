@@ -1,13 +1,14 @@
 import { expect, test } from "bun:test";
 import { mkdtempSync, readFileSync } from "node:fs";
-import { tmpdir, homedir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as sdk from "@earendil-works/pi-coding-agent";
 import { effectiveContextTokens } from "../src/usage.ts";
 import { OUTPUT_CAP, SECTIONS } from "../src/summary.ts";
 
-const modules = join(homedir(), ".bun/install/global/node_modules");
+import { hostModules } from "../scripts/host-modules.mjs";
+const modules = hostModules();
 const { loadExtensions } = await import(join(modules, "@earendil-works/pi-coding-agent/dist/core/extensions/loader.js"));
 const { createAssistantMessageEventStream } = await import(join(modules, "@earendil-works/pi-ai/dist/compat.js"));
 const rootRepo = fileURLToPath(new URL("..", import.meta.url));
